@@ -1,0 +1,118 @@
+# Guest functions replaced by host implementations (hle_<Name> in runtime/hle_*.c).
+# One per line: a name found by tools/find_symbols.py, or `0xVA Name` for one it does not know.
+# After editing: re-run tools/lift.py with --hle runtime/hle.txt, then tools/build.py.
+
+# D3D: NV2A hardware bring-up has nothing to program on the host
+# CMiniport_InitHardware   (runs for real now, against the fake register block in nv2a.c)
+
+# (CDevice_KickOff runs for real: its DMA_PUT register write makes nv2a.c consume the push buffer)
+
+# D3D: DMA context objects (wrapped to learn their layout)
+CMiniport_CreateCtxDmaObject
+
+
+# DirectSound: silent host implementation (runtime/hle_dsound.c)
+DirectSoundCreate
+IDirectSound_Release
+IDirectSound_SynchPlayback
+IDirectSound_CommitDeferredSettings
+IDirectSound_SetDopplerFactor
+IDirectSound_SetI3DL2Listener
+IDirectSound_SetMixBinHeadroom
+IDirectSound_SetEffectData
+IDirectSound_GetEffectData
+IDirectSound_GetOutputLevels
+IDirectSound_DownloadEffectsImage
+XAudioSetEffectData
+0x3F1872 DirectSoundUseFullHRTF
+IDirectSound_CreateSoundBuffer
+DirectSoundCreateBuffer
+IDirectSoundBuffer_Play
+IDirectSoundBuffer_PlayEx
+IDirectSoundBuffer_Stop
+IDirectSoundBuffer_StopEx
+IDirectSoundBuffer_GetStatus
+IDirectSoundBuffer_GetCurrentPosition
+IDirectSoundBuffer_SetCurrentPosition
+IDirectSoundBuffer_SetBufferData
+IDirectSoundBuffer_SetFormat
+IDirectSoundBuffer_Lock
+IDirectSoundBuffer_Unlock
+IDirectSoundBuffer_Release
+IDirectSoundBuffer_GetVoiceProperties
+IDirectSoundStream_GetVoiceProperties
+IDirectSound3DCalculator_GetVoiceData
+DirectSoundDoWork
+IDirectSound_CreateSoundStream
+DirectSoundCreateStream
+IDirectSoundStream_FlushEx
+IDirectSoundBuffer_SetVolume
+IDirectSoundBuffer_SetPitch
+IDirectSoundBuffer_SetFrequency
+IDirectSoundBuffer_SetMixBins
+IDirectSoundBuffer_SetMixBinVolumes_8
+IDirectSoundBuffer_SetOutputBuffer
+IDirectSoundBuffer_SetFilter
+IDirectSoundBuffer_SetEG
+IDirectSoundBuffer_SetLFO
+IDirectSoundBuffer_SetHeadroom
+IDirectSoundBuffer_SetLoopRegion
+IDirectSoundBuffer_SetPlayRegion
+IDirectSoundBuffer_SetMode
+IDirectSoundBuffer_SetMaxDistance
+IDirectSoundBuffer_SetMinDistance
+IDirectSoundBuffer_SetDopplerFactor
+IDirectSoundBuffer_SetI3DL2Source
+IDirectSoundBuffer_SetConeOutsideVolume
+IDirectSoundBuffer_SetConeAngles
+IDirectSoundBuffer_SetRolloffCurve
+IDirectSoundBuffer_SetConeOrientation
+IDirectSoundBuffer_SetPosition
+IDirectSoundBuffer_SetVelocity
+IDirectSoundBuffer_Set3DVoiceData
+IDirectSoundBuffer_Use3DVoiceData
+IDirectSoundStream_SetVolume
+IDirectSoundStream_SetPitch
+IDirectSoundStream_SetMixBins
+IDirectSoundStream_SetMixBinVolumes_8
+IDirectSoundStream_SetOutputBuffer
+IDirectSoundStream_SetFilter
+IDirectSoundStream_SetEG
+IDirectSoundStream_SetLFO
+IDirectSoundStream_SetHeadroom
+IDirectSoundStream_SetFormat
+IDirectSoundStream_Set3DVoiceData
+IDirectSoundStream_Use3DVoiceData
+IDirectSoundStream_Pause
+IDirectSound3DCalculator_Calculate3D
+
+# D3D: video overlay, composited by the renderer
+D3DDevice_EnableOverlay
+D3DDevice_UpdateOverlay
+
+# Input: host XInput pads + keyboard (runtime/hle_xinput.c)
+XInitDevices
+XGetDevices
+XGetDeviceChanges
+0x47EB26 XInputOpen
+XInputClose
+XInputGetCapabilities
+XInputGetState
+XInputSetState
+
+# XAPI fibers: on host fibers, since a lifted SwitchToFiber cannot move the host stack (runtime/hle_fiber.c)
+0x268EB3 CreateFiber
+0x268F52 SwitchToFiber
+0x268F91 ConvertThreadToFiber
+0x268F3F DeleteFiber
+# Forza: enhancements (runtime/hle_forza.c)
+0x1D96C0 ForzaDisplayModeSupported
+0x340C0 ForzaStringLookup
+0x35B040 ForzaMainMenu
+0x98230 ForzaScreenSwitch
+0x597E0 ForzaHumanControls
+0xB0A50 ForzaCarDrivers
+Lock2DSurface
+# Bink: cutscene upscaling (runtime/hle_bink.c)
+0x3ACF90 BinkCopyToBuffer
+0x3A99B0 BinkWrapperOpen

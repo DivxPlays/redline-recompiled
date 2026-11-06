@@ -1,0 +1,14 @@
+# copyrighted game data — never commit
+*.iso
+*.7z
+game/
+analysis/
+__pycache__/
+recomp/
+build/
+hdd/
+/RedlineLauncher.exe
+/launcher.ini
+/third_party/fsr/
+/third_party/dlss/
+/dist/

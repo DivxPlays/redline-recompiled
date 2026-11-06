@@ -1,0 +1,2 @@
+# Functions whose every call is logged (tools/lift.py --trace runtime/trace.txt): one hex VA per line.
+# Keep empty when not debugging: tracing is compiled into the lifted code.
