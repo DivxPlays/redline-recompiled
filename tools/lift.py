@@ -28,6 +28,9 @@ REG8H = {"ah": "eax", "ch": "ecx", "dh": "edx", "bh": "ebx"}
 CC = {"o": "O", "no": "NO", "b": "B", "ae": "AE", "e": "E", "ne": "NE", "be": "BE", "a": "A",
       "s": "S", "ns": "NS", "p": "P", "np": "NP", "l": "L", "ge": "GE", "le": "LE", "g": "G"}
 FUNCS_PER_FILE = 400
+# MSVC runs out of heap (C1002, pass 2) on the longest generated bodies at /O2 on the build machine.
+# A function at least this many lines long is emitted with optimization off; shorter ones keep /O2.
+OPT_OFF_MIN_LINES = 3000
 MMIO_SECTIONS = {"D3D"}  # sections whose code touches device registers
 
 
@@ -596,6 +599,13 @@ def write_if_changed(path, text):
         f.write(text)
 
 
+def fit_for_msvc(text):
+    """Wrap a very long function so that cl compiles it with optimization off (see OPT_OFF_MIN_LINES)."""
+    if text.count("\n") < OPT_OFF_MIN_LINES:
+        return text
+    return '#pragma optimize("", off)\n' + text + '\n#pragma optimize("", on)'
+
+
 def load_hle(path, symbols_json):
     """HLE list: one function per line, `Name` (looked up in the symbol scan) or `0xVA Name`; # comments."""
     names = {s["name"]: s["va"] for s in json.load(open(symbols_json))["symbols"]} if symbols_json else {}
@@ -652,10 +662,10 @@ def main():
                 parts.append(f"void hle_{name}(X86Ctx *c);\nvoid f_{va:08X}(X86Ctx *c) {{ "
                              f"c->last_fn = 0x{va:08X}u; hle_{name}(c); }}\n\n")
                 if f["blocks"]:  # keep the original as o_XXXXXXXX so a host version can wrap or defer to it
-                    parts.append(lifter.lift_function(f).replace(f"void f_{va:08X}(", f"void o_{va:08X}(", 1)
+                    parts.append(fit_for_msvc(lifter.lift_function(f).replace(f"void f_{va:08X}(", f"void o_{va:08X}(", 1))
                                  + "\n\n")
             else:
-                parts.append(lifter.lift_function(f) + "\n\n")
+                parts.append(fit_for_msvc(lifter.lift_function(f)) + "\n\n")
         write_if_changed(os.path.join(out_dir, f"funcs_{nfiles:03d}.c"), "".join(parts))
         nfiles += 1
 
