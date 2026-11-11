@@ -125,6 +125,7 @@ void achieve_readback(uint32_t width, uint32_t height);
 int achieve_count(void), achieve_earned(void), achieve_has(int i), achieve_toast_next(void);
 const char *achieve_name(int i), *achieve_desc(int i);           /* hle_forza.c: a menu is on screen (the pause menu too), not just the race */
 int forza_race_view(void);          /* hle_forza.c: the race, its countdown or its replay is on top; any thread */
+int forza_throwaway_view(void);     /* hle_forza.c: the race, its countdown or the pre-race screen: never kept */
 int forza_racing(void);              /* hle_forza.c: the race (or its countdown) is the screen on top; any thread */
 void profile_run(int seconds); /* profile.c */
 #define AUDIO_RATE 48000         /* the Xbox APU's rate, and the host output's */

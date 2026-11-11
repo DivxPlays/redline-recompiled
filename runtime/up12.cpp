@@ -85,9 +85,17 @@ static int shared(Shared *s, UINT w, UINT h, DXGI_FORMAT f, UINT bind) {
     return 1;
 }
 
+static double ms_since(LARGE_INTEGER t0) { /* the start-up lines say how long each step took */
+    LARGE_INTEGER f, t;
+    QueryPerformanceFrequency(&f), QueryPerformanceCounter(&t);
+    return (t.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
+}
+
 static int init12(ID3D11Device *dev, ID3D11DeviceContext *ctx) {
     if (g_ready >= 0) return g_ready;
     g_ready = 0;
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
     IDXGIDevice *xd = NULL;
     IDXGIAdapter *ad = NULL;
     DXGI_ADAPTER_DESC desc;
@@ -118,7 +126,7 @@ static int init12(ID3D11Device *dev, ID3D11DeviceContext *ctx) {
     }
     CloseHandle(fh);
     g_list->Close();
-    fprintf(stderr, "[upscale] D3D12 device ready\n");
+    fprintf(stderr, "[upscale] D3D12 device ready (%.0f ms)\n", ms_since(t0));
     return g_ready = 1;
 }
 
@@ -132,6 +140,8 @@ static int g_dlss_ok = -1;
 static int dlss_ready(void) {
     if (g_dlss_ok >= 0) return g_dlss_ok;
     g_dlss_ok = 0;
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
     wchar_t dir[MAX_PATH];
     GetModuleFileNameW(NULL, dir, MAX_PATH);
     if (wchar_t *slash = wcsrchr(dir, L'\\')) *slash = 0;
@@ -148,12 +158,14 @@ static int dlss_ready(void) {
         fprintf(stderr, "[dlss] not available (%08X): it needs an NVIDIA RTX GPU and a recent driver\n", (unsigned)r);
         return 0;
     }
-    fprintf(stderr, "[dlss] ready\n");
+    fprintf(stderr, "[dlss] ready (%.0f ms)\n", ms_since(t0));
     return g_dlss_ok = 1;
 }
 
 static int dlss_make(UINT iw, UINT ih, UINT ow, UINT oh) {
     if (g_dlss) NVSDK_NGX_D3D12_ReleaseFeature(g_dlss), g_dlss = NULL;
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
     double ratio = (double)ow / iw;
     NVSDK_NGX_PerfQuality_Value q = ratio <= 1.01   ? NVSDK_NGX_PerfQuality_Value_DLAA
                                     : ratio <= 1.55 ? NVSDK_NGX_PerfQuality_Value_MaxQuality
@@ -171,7 +183,7 @@ static int dlss_make(UINT iw, UINT ih, UINT ow, UINT oh) {
         return 0;
     }
     static const char *names[] = {"Performance", "Balanced", "Quality", "Ultra Performance", "Ultra Quality", "DLAA"};
-    fprintf(stderr, "[dlss] %ux%u -> %ux%u (%s)\n", iw, ih, ow, oh, names[q]);
+    fprintf(stderr, "[dlss] %ux%u -> %ux%u (%s, %.0f ms)\n", iw, ih, ow, oh, names[q], ms_since(t0));
     g_dlss_in[0] = iw, g_dlss_in[1] = ih, g_dlss_out[0] = ow, g_dlss_out[1] = oh;
     return 1;
 }
@@ -211,6 +223,8 @@ static void fsr_message(uint32_t type, const wchar_t *m) { fwprintf(stderr, L"[f
 static int fsr_ready(void) {
     if (g_fsr_ok >= 0) return g_fsr_ok;
     g_fsr_ok = 0;
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
     HMODULE m = LoadLibraryW(L"amd_fidelityfx_loader_dx12.dll"); /* finds the upscaler DLL next to it, by the exe */
     if (!m) {
         fprintf(stderr, "[fsr3] amd_fidelityfx_loader_dx12.dll is missing\n");
@@ -218,12 +232,14 @@ static int fsr_ready(void) {
     }
     ffxLoadFunctions(&g_ffx, m);
     if (!g_ffx.CreateContext || !g_ffx.Dispatch || !g_ffx.DestroyContext) return 0;
-    fprintf(stderr, "[fsr3] ready\n");
+    fprintf(stderr, "[fsr3] ready (%.0f ms)\n", ms_since(t0));
     return g_fsr_ok = 1;
 }
 
 static int fsr_make(UINT iw, UINT ih, UINT ow, UINT oh) {
     if (g_fsr) g_ffx.DestroyContext(&g_fsr, NULL), g_fsr = NULL;
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
     ffxCreateBackendDX12Desc be = {};
     be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
     be.device = g_d12;
@@ -240,7 +256,7 @@ static int fsr_make(UINT iw, UINT ih, UINT ow, UINT oh) {
         g_fsr = NULL;
         return 0;
     }
-    fprintf(stderr, "[fsr3] %ux%u -> %ux%u\n", iw, ih, ow, oh);
+    fprintf(stderr, "[fsr3] %ux%u -> %ux%u (%.0f ms)\n", iw, ih, ow, oh, ms_since(t0));
     g_fsr_in[0] = iw, g_fsr_in[1] = ih, g_fsr_out[0] = ow, g_fsr_out[1] = oh;
     return 1;
 }
@@ -284,6 +300,30 @@ static void barrier(ID3D12Resource *r, D3D12_RESOURCE_STATES from, D3D12_RESOURC
     b.Transition.StateBefore = from, b.Transition.StateAfter = to;
     g_list->ResourceBarrier(1, &b);
 }
+
+/* The slow first steps on a thread of their own, started with the game: NGX's start-up alone took 1.8 s, a freeze on
+ * whichever frame first needed DLSS (car select, or a race's countdown). Until it is done, upscale_warming() says so
+ * and the renderer scales those frames the plain way; upscale_run is not called meanwhile. */
+static volatile LONG g_warming;
+static ID3D11Device *g_warm_dev;
+static ID3D11DeviceContext *g_warm_ctx;
+
+static DWORD WINAPI warm_thread(void *p) {
+    if (init12(g_warm_dev, g_warm_ctx)) (INT_PTR)p == 2 ? dlss_ready() : fsr_ready();
+    InterlockedExchange(&g_warming, 0); /* a full barrier: what it set up is seen by whoever reads 0 */
+    return 0;
+}
+
+extern "C" void upscale_warm(int which, ID3D11Device *dev, ID3D11DeviceContext *ctx) {
+    if ((which != 2 && which != 3) || g_warming || (g_ready >= 0 && (which == 2 ? g_dlss_ok : g_fsr_ok) >= 0)) return;
+    g_warm_dev = dev, g_warm_ctx = ctx;
+    InterlockedExchange(&g_warming, 1);
+    HANDLE h = CreateThread(NULL, 0, warm_thread, (void *)(INT_PTR)which, 0, NULL);
+    if (h) CloseHandle(h);
+    else InterlockedExchange(&g_warming, 0); /* no thread: the first frame does it, as before */
+}
+
+extern "C" int upscale_warming(void) { return InterlockedCompareExchange(&g_warming, 0, 0) != 0; }
 
 /* which (2 DLSS, 3 FSR 3): the frame `color` (iw x ih), its depth (R32F) and motion (RG16F) -> a view of the
  * upscaled picture (ow x oh), or NULL when the upscaler cannot run (the caller scales as before) */

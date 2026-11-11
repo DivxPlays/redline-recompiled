@@ -1,8 +1,11 @@
 <p align="center"><img src="launcher/emblem.png" width="128" alt="Redline Recompiled emblem"></p>
 
-<h1 align="center">Redline Recompiled 0.2.0 alpha</h1>
+<h1 align="center">Redline Recompiled 0.2.1 alpha</h1>
 
 <p align="center">A PC port of <b>Forza Motorsport</b> (Xbox, 2005), made by static recompilation.</p>
+
+<p align="center"><a href="https://github.com/DivxPlays/redline-recompiled/releases/download/v0.2.0-alpha/trailer.mp4"><img src="docs/images/trailer.gif" width="480" alt="Five seconds of the trailer: racing at Road Atlanta and Tsukuba"></a><br>
+<a href="https://github.com/DivxPlays/redline-recompiled/releases/download/v0.2.0-alpha/trailer.mp4"><b>Watch the trailer</b></a> (1 minute)</p>
 
 > [!WARNING]
 > **Alpha.** It plays from start to finish, but performance may be unstable, and expect bugs and crashes.
@@ -60,7 +63,7 @@ builds the port from **your own copy** of the disc, on your PC.
 
 ## Install and play
 
-1. Download **RedlineRecompiled-0.2.0.zip** from the [Releases](../../releases) page and unzip it to a folder whose
+1. Download **RedlineRecompiled-0.2.1.zip** from the [Releases](../../releases) page and unzip it to a folder whose
    path is short, at most 120 characters (for example `C:\Games\RedlineRecompiled`). (The green Code button's
    download has no launcher in it: `python tools/build.py --launcher` makes one, with Visual Studio.)
 2. Run **RedlineLauncher.exe**.

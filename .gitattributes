@@ -1,0 +1,2 @@
+# Only for the README on GitHub: not in the release zip (tools/package.py, git archive)
+docs/images/trailer.gif export-ignore

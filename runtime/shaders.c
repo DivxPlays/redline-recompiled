@@ -99,6 +99,7 @@ static const char *g_vsh_epilogue =
     "  vo.fog = o[5]; vo.t0 = o[9]; vo.t1 = o[10]; vo.t2 = o[11]; vo.t3 = o[12];\n"
     "#ifdef MV\n"
     "  { float4 q = prev_pos(v); float pw = q.w; if (pw == 0 || isinf(pw)) pw = 1;\n"
+    "    if (ui.x != 1 && (pw == 1 || ui.z > 0)) q.x = ui.y + (q.x - ui.y) * ui.x;\n"
     "    vo.mv0 = float4(vo.pos.xy, w, 0);\n"
     "    vo.mv1 = float4(float2(q.x / surf.x * 2 - 1, 1 - q.y / surf.y * 2) * pw, pw, 0);\n"
     "    vo.pos.xy += jitter.xy * w; }\n"

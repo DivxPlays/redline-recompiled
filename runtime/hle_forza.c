@@ -389,6 +389,13 @@ int forza_race_view(void) {
     return vt == 0x4958E4 || vt == 0x4BCC04 || (vt == 0x4BEF3C && MF32(top + 0x2A4) >= 480);
 }
 
+/* the race, its countdown, or the pre-race screen over the track (CPreEventOverlay): pictures the game never keeps,
+ * so a draw may go without a shader still compiling (render.c). Not replays, which may be photographed. */
+int forza_throwaway_view(void) {
+    uint32_t top = g_ui ? M32(g_ui + 4) : 0, vt = top ? M32(top) : 0;
+    return vt == 0x4958E4 || vt == 0x4BCC04 || vt == 0x4BDD1C;
+}
+
 int forza_menu_open(void) {
     static uint32_t last = 1;
     static int log = -1;

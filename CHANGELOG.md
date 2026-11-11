@@ -11,6 +11,19 @@
 - ...
 -->
 
+## 0.2.1 Alpha (2026-11-10)
+
+### Fixed
+- No more freeze of about 2 seconds the first time a 3D scene shows with DLSS or FSR 3 on (at car select, or a race's
+  countdown): the upscaler now starts while the game boots.
+- Far less stutter in races the first time new cars, tracks or effects appear: the graphics they need are now
+  prepared in the background, several at once, instead of the race waiting for them (the first race's loading
+  screen froze for about 3 seconds, its start for 1). (#3)
+- With Ultrawide on a 21:9 or 32:9 screen, the rear-view mirror was stretched sideways, its cars twice as wide; it
+  keeps its shape now.
+- The loading screen before a race shows the track's picture, map and conditions. It showed a magnified, cut-off
+  copy of the car select screen with a black box where the car had been. (#21)
+
 ## 0.2.0 Alpha (2026-11-10)
 
 ### New

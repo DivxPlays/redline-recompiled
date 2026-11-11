@@ -219,6 +219,8 @@ void render_init(void) {
     hr = ID3D11DeviceContext_QueryInterface(ctx, &IID_ID3D11DeviceContext1, (void **)&g_ctx);
     if (FAILED(hr)) fail("ID3D11DeviceContext1", hr);
     ID3D11DeviceContext_Release(ctx);
+    if (cfg_get("FSR", "fsr", DEF_FSR) >= 2) render_fsr(cfg_get("FSR", "fsr", DEF_FSR)); /* now with a device: DLSS
+                                                                                * or FSR 3 starts (render_fsr_) */
 
     IDXGIDevice *dxgi_dev;
     IDXGIAdapter *adapter;
@@ -523,6 +525,10 @@ static D3D11_RECT clear_rect(const Target *t, const Surface *s, int x0, int y0, 
     float xs = (float)t->hw / t->w; /* host pixels per guest pixel across */
     D3D11_RECT r = {(LONG)(x0 * (int)s->aa_x * xs), y0 * (int)s->aa_y * RENDER_SCALE,
                     (LONG)((x1 + 1) * (int)s->aa_x * xs), (y1 + 1) * (int)s->aa_y * RENDER_SCALE};
+    if (t->wide && forza_race_view() && s->aa_x > 1 && (x0 > 0 || x1 + 1 < (int)(s->width / s->aa_x))) {
+        float cx = t->hw * 0.5f; /* the rear-view mirror's rect: squeezed as its draws are (ui_squeeze) */
+        r.left = (LONG)(cx + (r.left - cx) / g_widen), r.right = (LONG)(cx + (r.right - cx) / g_widen);
+    }
     return r;
 }
 
@@ -563,19 +569,86 @@ void render_clear(const Surface *s, uint32_t flags, uint32_t argb, uint32_t zste
 
 /* ---------------- shaders ---------------- */
 
+/* A shader this PC has not compiled before (~30 ms each; a race's first frames wanted ~100 at once, a 3 s freeze) is
+ * compiled by worker threads, several at a time, when the picture is one the game never keeps (forza_throwaway_view:
+ * the race, its countdown, the pre-race screen): its draws are left out for the few frames that takes. Elsewhere the
+ * draw waits for it as before: a paint job is rendered into a texture and saved, a car's icon copied off the screen. */
+typedef struct Job {
+    struct Job *next;
+    char *src;
+    int pixel;
+    char path[MAX_PATH];
+    void *shader;
+    volatile LONG done;
+} Job;
+static SRWLOCK g_job_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_job_cv = CONDITION_VARIABLE_INIT;
+static Job *g_job_head, *g_job_tail;
+#define PENDING(j) ((void *)((uintptr_t)(j) | 1)) /* a draw's shader slot while the compile runs */
+#define IS_PENDING(p) ((uintptr_t)(p) & 1)
+
 static struct {
     uint64_t hash;
     void *shader; /* ID3D11VertexShader / ID3D11PixelShader */
+    Job *job;     /* compiling on a worker */
 } g_shaders[MAX_SHADERS];
-static int64_t g_compile_ticks; /* FPSLOG */
-static int g_compiles;
+static volatile LONG64 g_compile_ticks; /* FPSLOG */
+static volatile LONG g_compiles;
 
-static void *shader(const char *src, int pixel) {
+/* compiled, made and written to the cache, on the draw's thread or a worker's (the device is free-threaded) */
+static void *compile_shader(const char *src, int pixel, const char *path) {
+    LARGE_INTEGER c0, c1; /* FPSLOG */
+    QueryPerformanceCounter(&c0);
+    ID3DBlob *code = compile(src, pixel ? "ps_5_0" : "vs_5_0");
+    QueryPerformanceCounter(&c1);
+    InterlockedExchangeAdd64(&g_compile_ticks, c1.QuadPart - c0.QuadPart);
+    InterlockedIncrement(&g_compiles), InterlockedIncrement((volatile LONG *)&g_compiles_made);
+    void *bytes = ID3D10Blob_GetBufferPointer(code), *sh = NULL;
+    size_t size = ID3D10Blob_GetBufferSize(code);
+    HRESULT hr = pixel ? ID3D11Device_CreatePixelShader(g_dev, bytes, size, NULL, (ID3D11PixelShader **)&sh)
+                       : ID3D11Device_CreateVertexShader(g_dev, bytes, size, NULL, (ID3D11VertexShader **)&sh);
+    FILE *f;
+    if (SUCCEEDED(hr) && (f = fopen(path, "wb"))) fwrite(bytes, 1, size, f), fclose(f);
+    ID3D10Blob_Release(code);
+    if (FAILED(hr)) fail("create shader", hr);
+    return sh;
+}
+
+static DWORD WINAPI shader_worker(void *p) {
+    (void)p;
+    for (;;) {
+        AcquireSRWLockExclusive(&g_job_lock);
+        while (!g_job_head) SleepConditionVariableSRW(&g_job_cv, &g_job_lock, INFINITE, 0);
+        Job *j = g_job_head;
+        if (!(g_job_head = j->next)) g_job_tail = NULL;
+        ReleaseSRWLockExclusive(&g_job_lock);
+        j->shader = compile_shader(j->src, j->pixel, j->path);
+        free(j->src), j->src = NULL;
+        InterlockedExchange(&j->done, 1); /* a full barrier: whoever sees done sees the shader */
+    }
+}
+
+/* a pending slot's shader once its worker is done (waiting for it if `wait`), else still pending */
+static void *finished(void *p, int wait) {
+    Job *j = (Job *)((uintptr_t)p & ~(uintptr_t)1);
+    while (!InterlockedCompareExchange(&j->done, 0, 0)) {
+        if (!wait) return p;
+        Sleep(1);
+    }
+    return j->shader;
+}
+
+static void *shader(const char *src, int pixel, int wait) {
     uint64_t h = fnv(src, strlen(src), FNV0 + pixel);
     int i, free_slot = -1;
     for (i = 0; i < MAX_SHADERS; i++) {
         if (g_shaders[i].hash == h && g_shaders[i].shader) return g_shaders[i].shader;
-        if (!g_shaders[i].shader && free_slot < 0) free_slot = i;
+        if (g_shaders[i].hash == h && g_shaders[i].job) { /* asked for again under another key */
+            void *sh = finished(PENDING(g_shaders[i].job), wait);
+            if (!IS_PENDING(sh)) g_shaders[i].shader = sh;
+            return sh;
+        }
+        if (!g_shaders[i].shader && !g_shaders[i].job && free_slot < 0) free_slot = i;
     }
     if (free_slot < 0) fail("shader cache full", 0);
     /* shadercache/<hash>.vs/.ps next to the exe: compiled once, ever (a compile took ~35 ms, a stutter each time a
@@ -603,24 +676,34 @@ static void *shader(const char *src, int pixel) {
         free(bytes);
         fclose(f);
     }
-    if (FAILED(hr)) {
-        LARGE_INTEGER c0, c1; /* FPSLOG */
-        QueryPerformanceCounter(&c0);
-        ID3DBlob *code = compile(src, pixel ? "ps_5_0" : "vs_5_0");
-        QueryPerformanceCounter(&c1);
-        g_compile_ticks += c1.QuadPart - c0.QuadPart, g_compiles++, g_compiles_made++;
-        void *bytes = ID3D10Blob_GetBufferPointer(code);
-        size_t size = ID3D10Blob_GetBufferSize(code);
-        hr = pixel ? ID3D11Device_CreatePixelShader(g_dev, bytes, size, NULL, (ID3D11PixelShader **)&sh)
-                   : ID3D11Device_CreateVertexShader(g_dev, bytes, size, NULL, (ID3D11VertexShader **)&sh);
-        if (SUCCEEDED(hr) && (f = fopen(path, "wb"))) fwrite(bytes, 1, size, f), fclose(f);
-        ID3D10Blob_Release(code);
+    if (getenv("SHADER_DUMP")) fprintf(stderr, "---- %s ----\n%s\n", pixel ? "pixel" : "vertex", src);
+    if (FAILED(hr) && !wait) { /* to a worker: the draw goes without it until it is done */
+        static int workers;
+        if (!workers) {
+            SYSTEM_INFO si;
+            GetSystemInfo(&si);
+            workers = si.dwNumberOfProcessors > 4 ? (int)si.dwNumberOfProcessors - 2 : 2; /* the game's own threads */
+            workers = workers > 8 ? 8 : workers;
+            for (int w = 0; w < workers; w++) CloseHandle(CreateThread(NULL, 0, shader_worker, NULL, 0, NULL));
+        }
+        Job *j = calloc(1, sizeof *j); /* kept: draws' slots point at it */
+        if (!j || !(j->src = _strdup(src))) fail("out of memory for a shader", 0);
+        j->pixel = pixel;
+        strcpy(j->path, path);
+        AcquireSRWLockExclusive(&g_job_lock);
+        if (g_job_tail) g_job_tail->next = j;
+        else g_job_head = j;
+        g_job_tail = j;
+        ReleaseSRWLockExclusive(&g_job_lock);
+        WakeConditionVariable(&g_job_cv);
+        g_shaders[free_slot].hash = h;
+        g_shaders[free_slot].job = j;
+        return PENDING(j);
     }
-    if (FAILED(hr)) fail("create shader", hr);
+    if (FAILED(hr)) sh = compile_shader(src, pixel, path);
     g_shaders[free_slot].hash = h;
     g_shaders[free_slot].shader = sh;
     if (ktrace()) fprintf(stderr, "[render] compiled %s shader %016llX\n", pixel ? "pixel" : "vertex", (unsigned long long)h);
-    if (getenv("SHADER_DUMP")) fprintf(stderr, "---- %s ----\n%s\n", pixel ? "pixel" : "vertex", src);
     return sh;
 }
 
@@ -764,6 +847,15 @@ static ID3D11ShaderResourceView *target_cube(uint32_t addr, uint32_t face, Targe
     return g_cubes[i].srv;
 }
 
+/* the render target a 2D texture reads, if any. Never a compressed or palettised one: the game's own picture at a
+ * target's old address, as the loading screen's backdrop (the last menu frame read back, shrunk to 640x480 and
+ * compressed to DXT5 where that menu's target was) had shown the stale target instead, magnified and without the car */
+static Target *texture_target(const TexDesc *t) {
+    uint32_t color = (t->format >> 8) & 0xFF;
+    if (color == 0x0B || color == 0x0C || color == 0x0E || color == 0x0F) return NULL; /* I8, DXT1, DXT3, DXT5 */
+    return tex_kind(t->format) == TK_2D ? find_target(t->addr, 0) : NULL;
+}
+
 /* host view for texture unit `t`; *scale gets the coordinate scale for unnormalised (rect) textures */
 static ID3D11ShaderResourceView *texture(const TexDesc *t, float scale[2], int ui) {
     scale[0] = scale[1] = 1;
@@ -791,7 +883,7 @@ static ID3D11ShaderResourceView *texture(const TexDesc *t, float scale[2], int u
             if (ft) return target_cube(t->addr, face, ft);
         }
     }
-    Target *rt = kind == TK_2D ? find_target(t->addr, 0) : NULL;
+    Target *rt = texture_target(t);
     if (rt) { /* render-to-texture */
         uint32_t color = (t->format >> 8) & 0xFF;
         if (color >= 0x10 && color != 0x19 && color != 0x1A) { /* linear: unnormalised coordinates */
@@ -1353,7 +1445,17 @@ static const Snapshot *scene_of(uint32_t addr) {
 static float ui_squeeze(const Draw *d, const Target *color, int rt_read, int *all) {
     const Surface *s = &d->surf;
     *all = 0;
-    if (!color->wide || g_k[KM(0x030C)]) return 1; /* the depth test on: 3D */
+    if (!color->wide) return 1;
+    if (g_k[KM(0x030C)]) { /* the depth test on: 3D, as wide as the screen, but for a race's view of its own in part
+                            * of the width, the rear-view mirror: its camera is not widened (hle_forza.c), so it is
+                            * squeezed whole to its 16:9 shape, else its cars came out twice as wide at 32:9. Only
+                            * the anti-aliased scene's: the mirror's light pass, drawn first into a corner of a plain
+                            * target, stays where the mirror's draws look it up (their texture coordinates come from
+                            * their unsqueezed positions); squeezed too, the mirror's road was split down the middle */
+        if (!forza_race_view() || s->aa_x < 2 || s->clip_w * s->aa_x >= color->w) return 1;
+        *all = 1;
+        return 1 / g_widen;
+    }
     float p[4], q[4], x0 = 1e30f, x1 = -1e30f;
     int same = d->nindices <= 64; /* a fill is a quad or few; a bigger flat-coloured draw was compared vertex by vertex */
     for (uint32_t i = 1; i < d->nindices && same; i++)
@@ -1452,18 +1554,20 @@ void render_draw(const Draw *d) {
     int mv = g_mv_on && !g_supersampled && depth && g_k[KM(0x030C)] && s->width / s->aa_x >= g_present_w && s->height / s->aa_y >= g_present_h;
 
     /* shaders */
+    int wait = !forza_throwaway_view(); /* else a new shader compiles on a worker and the draw waits a frame or few */
     uint64_t vkey = d->program ? vsh_key(d->program, d->program_start) : ~0ull;
     void **vs = keyed(0, vkey ^ (mv ? 0x4D56000000000000ull : 0)); /* "MV": the variants with motion */
     if (!*vs) {
         if (d->program) vsh_generate(d->program, d->program_start, src, sizeof src, mv);
         else vsh_fixed(src, sizeof src, mv);
-        *vs = shader(src, 0);
-    }
+        *vs = shader(src, 0, wait);
+    } else if (IS_PENDING(*vs)) *vs = finished(*vs, wait);
     void **ps = keyed(1, psh_key(g_k) ^ (mv ? 0x4D56000000000000ull : 0));
     if (!*ps) {
         psh_generate(g_k, src, sizeof src, mv);
-        *ps = shader(src, 1);
-    }
+        *ps = shader(src, 1, wait);
+    } else if (IS_PENDING(*ps)) *ps = finished(*ps, wait);
+    if (IS_PENDING(*vs) || IS_PENDING(*ps)) return;
 
     /* constants */
     static Constants k;
@@ -1496,7 +1600,7 @@ void render_draw(const Draw *d) {
     for (int t = 0; t < 4; t++) {
         float sc[2] = {1, 1};
         srv[t] = d->tex[t].enabled ? texture(&d->tex[t], sc, s->ui_w != 0) : g_dummy_srv;
-        if (d->tex[t].enabled && tex_kind(d->tex[t].format) == TK_2D && find_target(d->tex[t].addr, 0)) rt_read = 1;
+        if (d->tex[t].enabled && texture_target(&d->tex[t])) rt_read = 1;
         smp[t] = sampler(&d->tex[t]);
         k.texscale[t][0] = sc[0];
         k.texscale[t][1] = sc[1];
@@ -1823,6 +1927,10 @@ static int g_fsr; /* UPSCALING, below */
 ID3D11ShaderResourceView *upscale_run(int which, ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *color,
                                       ID3D11Texture2D *depth, ID3D11Texture2D *motion, unsigned iw, unsigned ih,
                                       unsigned ow, unsigned oh, float jx, float jy, int reset, float ms);
+/* up12.cpp: the D3D12 device and the upscaler's library started on a thread of their own (they took ~2 s), and
+ * whether that is still going */
+void upscale_warm(int which, ID3D11Device *dev, ID3D11DeviceContext *ctx);
+int upscale_warming(void);
 
 typedef struct {
     ID3D11Texture2D *tex;
@@ -1885,6 +1993,7 @@ static int temporal(ID3D11Texture2D *back, const D3D11_VIEWPORT *vp, ID3D11Textu
     static int failed;
     UINT ow = (UINT)vp->Width, oh = (UINT)vp->Height;
     if (ow < w || oh < h) ow = w, oh = h;
+    if (upscale_warming()) return 0; /* still starting: this frame the plain way */
     if (snap->frame != last || snap->addr != last_addr || !out) {
         if (!frame_inputs(snap, w, h)) return 0;
         int reset = last == ~0u || snap->frame - last > 4; /* no history: a cut, or the first frame */
@@ -1999,6 +2108,7 @@ static void render_fsr_(int mode) {
     g_fsr = mode;
     g_jitter_on = mode >= 2;
     render_motion(mode >= 2);
+    if (g_dev) upscale_warm(mode, g_dev, (ID3D11DeviceContext *)g_ctx); /* chosen in the settings: started now */
 }
 void render_fsr(int mode) { /* other threads' way in: with the GPU lock */
     gpu_enter();
@@ -2323,7 +2433,7 @@ void render_present(uint32_t addr) {
                 "%.2f ms of push buffer (%.2f ms hashing %.1f MB of textures, %u decoded); %d shaders compiled in %.0f ms\n",
                 n * 1000.0 / span, g_shown * 1000.0 / span, g_new * 1000.0 / span, span / n, worst, slow, busy / n,
                 (push - push0) * 1000.0 / f.QuadPart / n, g_hash_ticks * 1000.0 / f.QuadPart / n, g_hash_bytes / 1e6 / n,
-                g_tex_uploads - uploads0, g_compiles, g_compile_ticks * 1000.0 / f.QuadPart);
+                g_tex_uploads - uploads0, (int)g_compiles, g_compile_ticks * 1000.0 / f.QuadPart);
         n = slow = 0, worst = busy = 0, t0 = start, push0 = push, g_hash_ticks = g_hash_bytes = 0, g_shown = g_new = 0;
         uploads0 = g_tex_uploads;
         g_compiles = 0, g_compile_ticks = 0;

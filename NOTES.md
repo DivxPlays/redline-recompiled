@@ -484,8 +484,30 @@ Not for 0.1: Xbox Live (never), System Link, DES.
      Python not yet run (the DLSS and FSR files were copied in for the tests, to download nothing but the three
      approved tools). Visual Studio stays the development build (python tools/build.py).
 - **A how-to for making the texture pack** (tools/texextract.py, tools/texpack.py, Real-ESRGAN; and the videos).
-- From GitHub (DivxPlays/redline-recompiled, read 2026-11-08 and 2026-11-10; issues #1-3, #5-18, PR #4, none
-  answered yet):
+- From GitHub (DivxPlays/redline-recompiled, read 2026-11-08 and 2026-11-10; issues #1-3, #5-19, PR #4, none
+  answered yet; the 0.2.0 alpha release commit closed #1, #2, #5, #6 and #8-#18, and left #3 open for its hitches and
+  buttons):
+  - **#19 "can't change language"** (opened 2026-11-10, no text): Xbox games take their language from the
+    console's settings (XGetLanguage); not checked yet what the port answers. Find what kernel.c returns for it and
+    add a Language choice to Recomp Settings and the launcher; ask the reporter which language they wanted.
+  - **#20 the update checker never sees pre-releases** (found 2026-11-10 after 0.2.0): launcher.cpp asks for
+    /releases/latest, which skips pre-releases, and every alpha is one. Ask for /releases?per_page=1 instead; and
+    publish the next version as a full release (0.2.0 launchers read only /releases/latest). 0.2.0 alpha itself
+    was switched to a full release on 2026-11-10 (the repo page still showed 0.1.0 as Latest); CLAUDE.md now says
+    every release goes up as a full one.
+  - **#21 the loading screen into a race looks wrong** (the owner, 2026-11-10, at 32:9 with DLSS; no details yet):
+    CUILoadGame and the pre-race screen (CPreEventOverlay). Capture both at 16:9 and 32:9 (rt.now, SHOTEVERY) and
+    compare with how the game should show them. Rule out: since the stutter fix the pre-race screen skips draws whose
+    shader is still compiling (forza_throwaway_view; first time only, or after an update changes the generators: the
+    MV epilogue change recompiled every MV vertex shader), and ULTRAWIDE keeps 2D screens in the middle 16:9 (the
+    menus to-do item).
+    **Fixed 2026-11-10** (not released): neither. CUILoadGame draws the track's loading picture (its photo and logo,
+    map, time, temperature, wind, turns), a 1024x512 DXT5 texture (format 0F, coordinates 0..0.62 x 0..0.94: 640x480
+    of it) the game loads at 04B2C000, which was the car-select screen's render target. texture() took any 2D texture
+    at a target's address for that target, so it showed the stale car-select picture's top-left 62%: magnified at
+    16:9, off centre and cut off at 32:9, a black box where the car had been. texture_target() now never matches a
+    compressed or palettised format (I8, DXT1/3/5: no render target is one); render_draw's rt_read uses it too, so
+    the picture is a 2D draw (the middle 16:9 at ultrawide). Checked at 32:9 and 16:9.
   - **C1002, compiler out of heap in pass 2** (#2, #3, #8, #16; Visual Studio 2026 and Build Tools 2022, 16 GB RAM,
     16 CPUs): recomp/funcs_039.c's f_002E5DC0, f_002E6930, f_002E74E0, f_002E8050 (~4,000 lines each), then D8040.
     **Fixed 2026-11-10** (not released): measured alone, funcs_039.c took 65.4 GB of commit to compile (it built here
@@ -503,6 +525,25 @@ Not for 0.1: Xbox Live (never), System Link, DES.
     1,200 ms CUIPlayerProfile, 1,083 ms CUIOptionsMenu twice with no shaders or textures (CPU-side), 635 ms
     CUIScoreboardUpdating; menus 60-170 ms typically. Shaders could be compiled ahead (at build time, or warmed from
     a list) so a first race does not stall.
+    **Fixed 2026-11-10** (not released), measured on the owner's settings (1080i, scale 2, DLSS, ultrawide, 144 fps)
+    with FPSLOG and the [hitch] lines, the test's own screenshots off (SHOTEVERY's 21 MB BMPs every 20 frames had made
+    the race look stuttery: measure with scratchpad pace.ps1, not camtest):
+    - The ~2 s freeze at car select (or, in other runs, the race's countdown) was DLSS starting on the first frame
+      that needed it: the D3D12 device 81 ms, NGX's NVSDK_NGX_D3D12_Init 1,815 ms, the feature 51 ms. FSR 3 starts
+      the same way (its library; its context per size). up12.cpp upscale_warm now starts both on a thread of their
+      own when the device is made (render_fsr_ too, when the setting changes); until it is done, temporal() scales
+      the plain way. Car select: 2,102 ms -> 92 ms. The start-up lines now give each step's ms.
+    - First run, empty shader cache: 220 shaders at ~30 ms each (fxcbench.py on the game's 224 sources: optimisation
+      L0/L1/L3 all ~30 ms; skip-optimisation 21 ms with twice the DXBC: no flag fixes it). Car select 1.4 s, the
+      pre-race screen 3.3 s (101), the race's start 1.3 s (43), race windows with 44-56 compiles and 20+ late frames.
+      render.c now compiles a new shader on worker threads (cores - 2, at most 8) while forza_throwaway_view() (the
+      race, its countdown, CPreEventOverlay: pictures the game never keeps); its draws are skipped the few frames
+      that takes. Elsewhere the draw waits as before: a paint job is rendered into a texture and saved, a car's icon
+      copied off the screen. After: the pre-race screen's 94 compiles cost a 69 ms frame, the race none over 20 ms;
+      car select still 1.2 s once per PC (sync). Checked: a cold-cache race looks complete (cars, track, mirror, HUD).
+    - Left, warm cache: CUIPlayerProfile ~0.54 s and CPreEventOverlay ~1 s (no shaders: the game's own loading),
+      the countdown ~0.3 s (the texture pack's deliberate wait, g_texwait_ms 100, for a new scene's replacements),
+      and three 2-3 s gaps at boot behind the black screen.
   - **Controls vs the game's diagram** (#3): Controller Options with "Shift on A/B Buttons" shows X e-brake, A gear
     up, B gear down; the port's table (hle_xinput.c g_bind) has A e-brake, B up, X down, and the keyboard's E/Q send
     B/X. Check in the game which pad buttons shift under each Controller Options layout; match it or document it.
@@ -604,6 +645,13 @@ Not for 0.1: Xbox Live (never), System Link, DES.
   the other half, and the road's right half came out darker with a seam at the exact centre. Checked: all four views
   in a race at 16:9 / 4:3 / the owner's settings (ultrawide, 1080i, DLSS), no seam, the showroom and menus the same
   as before (pixel for pixel at 1080i). Not checked: replays, 32:9 exactly.
+  **The mirror at 21:9 / 32:9** (the owner, 2026-11-10: "the cars in there are super wide"): ULTRAWIDE widens the
+  game's camera aspects (hle_forza.c), not the mirror's camera, and its view (a clip of part of the AA scene, x 230+179
+  of 640) was stretched across the wide target: twice as wide at 32:9. Fixed (not released): ui_squeeze squeezes a
+  race's AA 3D draw clipped to part of the width whole to its 16:9 shape (as the track map), clear_rect its rect
+  clears, and the MV vertex epilogue the previous position too. Only the AA scene: the mirror's light pass is drawn
+  first into x 0+179 of a plain target and looked up by the mirror's draws at coordinates from their unsqueezed
+  positions; squeezing it too split the mirror's road down the middle (the owner saw it: "the shadows look wrong").
   Seen on the way: with ultrawide the menus fill only the middle 16:9 (next item).
 - **Menus that fill 16:9, 21:9 and 32:9 screens** (requested 2026-11-10, "for the future"). Today, by design
   (render.c ui_squeeze): with ULTRAWIDE the game's 2D (menus, dialogs, loading screens) goes into the middle 16:9 of
