@@ -2,13 +2,45 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "xbox.h"
 
 uint8_t *g_mem;
 
-extern const FuncEntry g_func_table[]; /* generated, sorted by va */
-extern const uint32_t g_func_count;
+/* the lifted game code, build/forza_recomp.dll beside the exe (x86.h): its table, sorted by va, and the originals
+ * (o_) the hle_*.c wrappers call */
+static const FuncEntry *g_func_table;
+static uint32_t g_func_count;
+GuestFn o_000340C0, o_000597E0, o_00098230, o_000B0A50, o_0035B040, o_003A99B0, o_003ACF90, o_003BFCA0, o_003C2A52;
+
+/* after g_mem is reserved: the DLL gets it, the runtime its table and originals */
+void game_load(void) {
+    static const struct { const char *name; GuestFn *fn; } origs[] = {
+        {"o_000340C0", &o_000340C0}, {"o_000597E0", &o_000597E0}, {"o_00098230", &o_00098230},
+        {"o_000B0A50", &o_000B0A50}, {"o_0035B040", &o_0035B040}, {"o_003A99B0", &o_003A99B0},
+        {"o_003ACF90", &o_003ACF90}, {"o_003BFCA0", &o_003BFCA0}, {"o_003C2A52", &o_003C2A52}};
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    char *slash = n ? strrchr(path, '\\') : NULL;
+    snprintf(slash ? slash + 1 : path, MAX_PATH - (slash ? slash + 1 - path : 0), "forza_recomp.dll");
+    HMODULE dll = LoadLibraryA(path);
+    if (!dll) {
+        fprintf(stderr, "cannot load %s (error %lu): build the game in the launcher first\n", path, GetLastError());
+        fatal_exit(1);
+    }
+    const uint32_t *count = (const uint32_t *)GetProcAddress(dll, "g_func_count");
+    uint8_t **mem = (uint8_t **)GetProcAddress(dll, "g_mem");
+    g_func_table = (const FuncEntry *)GetProcAddress(dll, "g_func_table");
+    int ok = count && mem && g_func_table;
+    for (size_t i = 0; ok && i < sizeof origs / sizeof origs[0]; i++) ok = (*origs[i].fn = (GuestFn)GetProcAddress(dll, origs[i].name)) != NULL;
+    if (!ok) {
+        fprintf(stderr, "%s is from another version of the runtime: build the game again in the launcher\n", path);
+        fatal_exit(1);
+    }
+    g_func_count = *count;
+    *mem = g_mem;
+}
 
 /* Host functions given guest addresses, for vtables the runtime builds (e.g. DirectSound streams). */
 static void (*g_thunks[256])(X86Ctx *c);

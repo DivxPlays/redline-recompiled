@@ -345,6 +345,7 @@ static void render_readback_(uint32_t addr, uint32_t fmt, uint32_t size) {
             }
         ID3D11DeviceContext1_Unmap(g_ctx, (ID3D11Resource *)st, 0);
         fprintf(stderr, "[render] target %08X read back (%ux%u%s)\n", addr, w, h, lin ? "" : ", swizzled");
+        achieve_readback(w, h); /* a paint job saved draws its livery at 1024 */
     }
     ID3D11Texture2D_Release(st);
 }
@@ -427,33 +428,41 @@ static Target *target(uint32_t addr, uint32_t w, uint32_t h, int depth) {
 
 static void upload(ID3D11Buffer **buf, UINT *size, UINT bind, const void *data, UINT bytes);
 
+/* the scissored clears below: a triangle that covers the target (at z 0), drawn with a scissor rect */
+static ID3D11VertexShader *g_fill_vs;
+static ID3D11RasterizerState *g_scissor_rs;
+static void fill_init(void) {
+    if (g_fill_vs) return;
+    ID3DBlob *v = compile("float4 main(uint id : SV_VertexID) : SV_Position {\n"
+                          "  return float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0, 1); }\n",
+                          "vs_5_0");
+    ID3D11Device_CreateVertexShader(g_dev, ID3D10Blob_GetBufferPointer(v), ID3D10Blob_GetBufferSize(v), NULL, &g_fill_vs);
+    ID3D10Blob_Release(v);
+    D3D11_RASTERIZER_DESC rd = {D3D11_FILL_SOLID, D3D11_CULL_NONE};
+    rd.ScissorEnable = TRUE;
+    ID3D11Device_CreateRasterizerState(g_dev, &rd, &g_scissor_rs);
+}
+
 /* A clear of only some colour channels, drawn as a target-filling triangle through a write mask (ClearView cannot
  * mask). Forza's car select clears just alpha (and depth) between the car's reflection and the car; clearing all
  * of RGBA there blacked out the reflection and the floor. mask: D3D11 write-enable bits, the order of NV2A's. */
 static void masked_clear(Target *t, const D3D11_RECT *r, const float c[4], UINT8 mask) {
-    static ID3D11VertexShader *vs;
     static ID3D11PixelShader *ps;
     static ID3D11Buffer *cb;
     static UINT cb_size;
     static ID3D11BlendState *blend[16];
     static ID3D11DepthStencilState *ds;
-    static ID3D11RasterizerState *rs;
-    if (!vs) {
-        ID3DBlob *v = compile("float4 main(uint id : SV_VertexID) : SV_Position {\n"
-                              "  return float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0, 1); }\n",
-                              "vs_5_0");
+    fill_init();
+    ID3D11VertexShader *vs = g_fill_vs;
+    ID3D11RasterizerState *rs = g_scissor_rs;
+    if (!ps) {
         ID3DBlob *p = compile("cbuffer C : register(b0) { float4 color; };\n"
                               "float4 main() : SV_Target { return color; }\n",
                               "ps_5_0");
-        ID3D11Device_CreateVertexShader(g_dev, ID3D10Blob_GetBufferPointer(v), ID3D10Blob_GetBufferSize(v), NULL, &vs);
         ID3D11Device_CreatePixelShader(g_dev, ID3D10Blob_GetBufferPointer(p), ID3D10Blob_GetBufferSize(p), NULL, &ps);
-        ID3D10Blob_Release(v);
         ID3D10Blob_Release(p);
         D3D11_DEPTH_STENCIL_DESC dd = {0};
         ID3D11Device_CreateDepthStencilState(g_dev, &dd, &ds);
-        D3D11_RASTERIZER_DESC rd = {D3D11_FILL_SOLID, D3D11_CULL_NONE};
-        rd.ScissorEnable = TRUE;
-        ID3D11Device_CreateRasterizerState(g_dev, &rd, &rs);
     }
     if (!blend[mask]) {
         D3D11_BLEND_DESC bd = {0};
@@ -480,6 +489,43 @@ static void masked_clear(Target *t, const D3D11_RECT *r, const float c[4], UINT8
     ID3D11DeviceContext1_OMSetRenderTargets(g_ctx, 0, NULL, NULL); /* draws rebind everything they use */
 }
 
+/* A depth/stencil clear of part of the target (ClearDepthStencilView clears all of it): the triangle through the
+ * scissor rect, its depth set by the viewport's range, the stencil replaced. Forza's bumper and hood views clear
+ * depth to 0 under the rear-view mirror only, so the scene leaves the mirror alone; clearing the whole target to 0
+ * left those views black but for the mirror. which: D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL. */
+static void depth_rect_clear(Target *z, const D3D11_RECT *r, UINT which, float depth, UINT8 stencil) {
+    static ID3D11DepthStencilState *ds[4];
+    fill_init();
+    if (!ds[which]) {
+        D3D11_DEPTH_STENCIL_DESC dd = {TRUE, which & D3D11_CLEAR_DEPTH ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO,
+                                       D3D11_COMPARISON_ALWAYS, (which & D3D11_CLEAR_STENCIL) != 0, 0xFF, 0xFF};
+        D3D11_DEPTH_STENCILOP_DESC op = {D3D11_STENCIL_OP_REPLACE, D3D11_STENCIL_OP_REPLACE, D3D11_STENCIL_OP_REPLACE,
+                                         D3D11_COMPARISON_ALWAYS};
+        dd.FrontFace = dd.BackFace = op;
+        ID3D11Device_CreateDepthStencilState(g_dev, &dd, &ds[which]);
+    }
+    D3D11_VIEWPORT vp = {0, 0, (float)z->hw, (float)z->hh, depth, depth};
+    ID3D11DeviceContext1_OMSetRenderTargets(g_ctx, 0, NULL, z->dsv);
+    ID3D11DeviceContext1_RSSetViewports(g_ctx, 1, &vp);
+    ID3D11DeviceContext1_RSSetScissorRects(g_ctx, 1, r);
+    ID3D11DeviceContext1_RSSetState(g_ctx, g_scissor_rs);
+    ID3D11DeviceContext1_OMSetDepthStencilState(g_ctx, ds[which], stencil);
+    ID3D11DeviceContext1_IASetInputLayout(g_ctx, NULL);
+    ID3D11DeviceContext1_IASetPrimitiveTopology(g_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext1_VSSetShader(g_ctx, g_fill_vs, NULL, 0);
+    ID3D11DeviceContext1_PSSetShader(g_ctx, NULL, NULL, 0);
+    ID3D11DeviceContext1_Draw(g_ctx, 3, 0);
+    ID3D11DeviceContext1_OMSetRenderTargets(g_ctx, 0, NULL, NULL);
+}
+
+/* a clear rect (guest pixels, inclusive) in the target's host pixels */
+static D3D11_RECT clear_rect(const Target *t, const Surface *s, int x0, int y0, int x1, int y1) {
+    float xs = (float)t->hw / t->w; /* host pixels per guest pixel across */
+    D3D11_RECT r = {(LONG)(x0 * (int)s->aa_x * xs), y0 * (int)s->aa_y * RENDER_SCALE,
+                    (LONG)((x1 + 1) * (int)s->aa_x * xs), (y1 + 1) * (int)s->aa_y * RENDER_SCALE};
+    return r;
+}
+
 void render_clear(const Surface *s, uint32_t flags, uint32_t argb, uint32_t zstencil, int x0, int y0, int x1, int y1) {
     if (s->ui_w) { /* a front-end rect: stretch it as pgraph_surface stretches the draws */
         int w = (int)(s->width / s->aa_x), h = (int)(s->height / s->aa_y);
@@ -488,9 +534,7 @@ void render_clear(const Surface *s, uint32_t flags, uint32_t argb, uint32_t zste
     }
     if ((flags & 0xF0) && s->color_addr) { /* NV097_CLEAR_SURFACE: [4] R, [5] G, [6] B, [7] A */
         Target *t = target(s->color_addr, s->width, s->height, 0);
-        float xs = (float)t->hw / t->w; /* host pixels per guest pixel across */
-        D3D11_RECT r = {(LONG)(x0 * (int)s->aa_x * xs), y0 * (int)s->aa_y * RENDER_SCALE,
-                        (LONG)((x1 + 1) * (int)s->aa_x * xs), (y1 + 1) * (int)s->aa_y * RENDER_SCALE};
+        D3D11_RECT r = clear_rect(t, s, x0, y0, x1, y1);
         float c[4] = {((argb >> 16) & 0xFF) / 255.0f, ((argb >> 8) & 0xFF) / 255.0f, (argb & 0xFF) / 255.0f,
                       (argb >> 24) / 255.0f};
         if ((flags & 0xF0) == 0xF0) ID3D11DeviceContext1_ClearView(g_ctx, (ID3D11View *)t->rtv, c, &r, 1);
@@ -500,9 +544,15 @@ void render_clear(const Surface *s, uint32_t flags, uint32_t argb, uint32_t zste
         Target *t = target(s->zeta_addr, s->width, s->height, 1);
         /* Z24S8: depth in the top 24 bits; Z16 uses the low 16 */
         float z = s->zeta_format == 1 ? (zstencil & 0xFFFF) / 65535.0f : (zstencil >> 8) / 16777215.0f;
-        ID3D11DeviceContext1_ClearDepthStencilView(g_ctx, t->dsv,
-                                                   (flags & 1 ? D3D11_CLEAR_DEPTH : 0) | (flags & 2 ? D3D11_CLEAR_STENCIL : 0),
-                                                   z, (UINT8)zstencil);
+        UINT which = (flags & 1 ? D3D11_CLEAR_DEPTH : 0) | (flags & 2 ? D3D11_CLEAR_STENCIL : 0);
+        /* part of the surface, not of the target: a depth buffer the AA scene shares is twice a 640-wide pass's
+         * width, and its whole-surface clears must still clear all of it (the first-person views' light pass) */
+        if (x0 > 0 || y0 > 0 || x1 + 1 < (int)(s->width / s->aa_x) || y1 + 1 < (int)(s->height / s->aa_y)) {
+            D3D11_RECT r = clear_rect(t, s, x0, y0, x1, y1);
+            depth_rect_clear(t, &r, which, z, (UINT8)zstencil);
+            return; /* part of the scene only: its motion vectors stay */
+        }
+        ID3D11DeviceContext1_ClearDepthStencilView(g_ctx, t->dsv, which, z, (UINT8)zstencil);
         Target *c = s->color_addr && (flags & 1) ? find_target(s->color_addr, 0) : NULL;
         if (c && c->mv_rtv) { /* the scene starts over: nothing has moved yet */
             static const float zero[4] = {0};
@@ -2005,6 +2055,105 @@ static void version_text(ID3D11Texture2D *back, UINT sw, UINT sh) {
     if (srv) blit(back, &vp, srv, 1);
 }
 
+/* an achievement just earned (achieve.c): a dark panel at the top middle with the emblem (the exe's icon), ACHIEVEMENT
+ * UNLOCKED, the name and how it was earned; it slides down in 0.3 s, stays 4 s and slides back up, one at a time.
+ * Drawn with GDI into a texture (premultiplied), as version_text. */
+static void toast_text(HDC dc, uint32_t *cov, int w, int h, float *px, int x, int y, int size, int weight, const char *s,
+                       float r, float g, float b) {
+    HFONT font = CreateFontA(-size, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
+    HGDIOBJ old = SelectObject(dc, font);
+    memset(cov, 0, (size_t)w * h * 4);
+    SetBkMode(dc, TRANSPARENT), SetTextColor(dc, RGB(255, 255, 255));
+    TextOutA(dc, x, y, s, (int)strlen(s));
+    GdiFlush();
+    for (int i = 0; i < w * h; i++) { /* the coverage over what is there, straight alpha */
+        float c = (cov[i] & 0xFF) / 255.0f, *p = px + 4 * i;
+        p[0] = p[0] * (1 - c) + r * c, p[1] = p[1] * (1 - c) + g * c, p[2] = p[2] * (1 - c) + b * c;
+        p[3] = p[3] + c * (1 - p[3]);
+    }
+    SelectObject(dc, old), DeleteObject(font);
+}
+
+static void achieve_toast(ID3D11Texture2D *back, UINT sw, UINT sh) {
+    static ID3D11ShaderResourceView *srv;
+    static UINT for_h, tw, th;
+    static int shown = -1;
+    static ULONGLONG start;
+    ULONGLONG now = GetTickCount64();
+    if (shown >= 0 && now - start > 4600) shown = -1;
+    if (shown < 0) {
+        if (srv) ID3D11ShaderResourceView_Release(srv), srv = NULL;
+        if ((shown = achieve_toast_next()) < 0) return;
+        start = now, for_h = 0;
+    }
+    if (!srv || for_h != sh) {
+        if (srv) ID3D11ShaderResourceView_Release(srv), srv = NULL;
+        for_h = sh;
+        int h = sh / 9 < 72 ? 72 : (int)sh / 9, w = h * 9 / 2, pad = h / 6, icon = h - 2 * pad;
+        tw = w, th = h;
+        float *px = calloc((size_t)w * h, 16);
+        for (int y = 0; y < h; y++) /* the panel: near black, 90%, corners rounded by pad / 2; a red edge on the left */
+            for (int x = 0; x < w; x++) {
+                int rr = pad / 2, cx = x < rr ? rr - x : x >= w - rr ? x - (w - rr - 1) : 0,
+                    cy = y < rr ? rr - y : y >= h - rr ? y - (h - rr - 1) : 0;
+                if (cx * cx + cy * cy > rr * rr) continue;
+                float *p = px + 4 * (y * w + x);
+                int edge = x < h / 18 + 1;
+                p[0] = edge ? 0.86f : 0.07f, p[1] = edge ? 0.12f : 0.07f, p[2] = edge ? 0.15f : 0.08f, p[3] = 0.9f;
+            }
+        HICON ico = (HICON)LoadImageA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(1), IMAGE_ICON, icon, icon, 0);
+        ICONINFO ii;
+        if (ico && GetIconInfo(ico, &ii)) { /* the emblem's 32-bit colour, straight alpha, over the panel */
+            BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), icon, -icon, 1, 32, BI_RGB}};
+            uint32_t *ib = malloc((size_t)icon * icon * 4);
+            HDC sdc = GetDC(NULL);
+            if (ii.hbmColor && GetDIBits(sdc, ii.hbmColor, 0, icon, ib, &bi, DIB_RGB_COLORS))
+                for (int y = 0; y < icon; y++)
+                    for (int x = 0; x < icon; x++) {
+                        uint32_t v = ib[y * icon + x];
+                        float a = (v >> 24) / 255.0f, *p = px + 4 * ((y + pad) * w + x + pad + h / 18 + 2);
+                        p[0] = p[0] * (1 - a) + ((v >> 16) & 0xFF) / 255.0f * a;
+                        p[1] = p[1] * (1 - a) + ((v >> 8) & 0xFF) / 255.0f * a;
+                        p[2] = p[2] * (1 - a) + (v & 0xFF) / 255.0f * a, p[3] = p[3] + a * (1 - p[3]);
+                    }
+            ReleaseDC(NULL, sdc), free(ib);
+            if (ii.hbmColor) DeleteObject(ii.hbmColor);
+            if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        }
+        if (ico) DestroyIcon(ico);
+        HDC dc = CreateCompatibleDC(NULL);
+        BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB}};
+        uint32_t *cov;
+        HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&cov, NULL, 0);
+        HGDIOBJ old_bm = SelectObject(dc, bm);
+        int tx = pad + h / 18 + 2 + icon + pad;
+        toast_text(dc, cov, w, h, px, tx, pad * 3 / 4, h / 6, FW_BOLD, "ACHIEVEMENT UNLOCKED", 0.95f, 0.25f, 0.27f);
+        toast_text(dc, cov, w, h, px, tx, pad * 3 / 4 + h / 5, h * 2 / 7, FW_BOLD, achieve_name(shown), 1, 1, 1);
+        toast_text(dc, cov, w, h, px, tx, pad * 3 / 4 + h / 5 + h * 3 / 10, h / 6, FW_NORMAL, achieve_desc(shown), 0.75f,
+                   0.75f, 0.78f);
+        SelectObject(dc, old_bm), DeleteObject(bm), DeleteDC(dc);
+        uint32_t *out = malloc((size_t)w * h * 4);
+        for (int i = 0; i < w * h; i++) { /* premultiplied BGRA */
+            float *p = px + 4 * i;
+            uint32_t a = (uint32_t)(p[3] * 255 + 0.5f);
+            out[i] = a << 24 | (uint32_t)(p[0] * p[3] * 255 + 0.5f) << 16 | (uint32_t)(p[1] * p[3] * 255 + 0.5f) << 8 |
+                     (uint32_t)(p[2] * p[3] * 255 + 0.5f);
+        }
+        free(px);
+        D3D11_TEXTURE2D_DESC td = {tw, th, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0}, D3D11_USAGE_IMMUTABLE,
+                                   D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        D3D11_SUBRESOURCE_DATA init = {out, tw * 4, 0};
+        ID3D11Texture2D *t;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_dev, &td, &init, &t)))
+            ID3D11Device_CreateShaderResourceView(g_dev, (ID3D11Resource *)t, NULL, &srv), ID3D11Texture2D_Release(t);
+        free(out);
+    }
+    float t = (now - start) / 1000.0f, in = t < 0.3f ? t / 0.3f : t > 4.3f ? (4.6f - t) / 0.3f : 1;
+    in = in < 0 ? 0 : in * in * (3 - 2 * in); /* eased */
+    D3D11_VIEWPORT vp = {(float)(sw - tw) / 2, -(float)th + in * (th + th / 5.0f), (float)tw, (float)th, 0, 1};
+    if (srv) blit(back, &vp, srv, 1);
+}
+
 /* The CRTC now scans out the framebuffer at guest address `addr`: show its host target. The frame (640x480, or the
  * game's own 1280x720 / 1920x1080 with VIDEOMODE) and the video overlay are composed at RENDER_SCALE, then fitted
  * into the window at the picture's aspect, black bars around: 16:9 when the game renders anamorphic widescreen, as
@@ -2046,6 +2195,7 @@ static void present(uint32_t addr) {
     if (frame % 15 == 0 && texpack_poll_keys()) render_texpack(1);
     texture_age();
     if (frame % 15 == 0 && DeleteFileA("build/wbuf.now")) fprintf(stderr, "[render] w-buffer %s\n", (g_wbuf ^= 1) ? "on" : "off");
+    if (frame % 15 == 0 && DeleteFileA("build/rt.now")) shot = frame + 1; /* SCREENSHOT's pictures of the next frame, now */
     RECT cr;
     GetClientRect(g_hwnd, &cr);
     if (cr.right <= 0 || cr.bottom <= 0) { /* minimised */
@@ -2109,6 +2259,7 @@ static void present(uint32_t addr) {
     } else if (g_fsr && vp.Width >= w && vp.Height >= h && (vp.Width > w || vp.Height > h)) fsr(back, &vp, composed_srv, w, h);
     else downsample(back, &vp, composed_srv, w, h);
     version_text(back, sw, sh);
+    achieve_toast(back, sw, sh);
     if (t && frame++ == shot) {
         screenshot(back, "build/frame.bmp");
         for (int i = 0; i < MAX_TARGETS; i++)

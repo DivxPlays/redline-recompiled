@@ -39,18 +39,30 @@ typedef struct {
     GuestFn fn;
 } FuncEntry;
 
-extern uint8_t *g_mem;
+/* The lifted game code is a DLL (build/forza_recomp.dll), made on the player's PC; the runtime (redline.exe, no game
+ * code, so it can ship built) loads it. The DLL (GAME_DLL) imports the runtime's helpers below and its hle_ functions
+ * (exported by build.py's redline.def) and exports its function table, its originals (o_) and its own g_mem, which
+ * the runtime sets once: memory access costs what it did in one program. */
+#ifdef GAME_DLL
+#define RT_API __declspec(dllimport)
+#define GAME_API __declspec(dllexport)
+#else
+#define RT_API
+#define GAME_API
+#endif
 
-void x86_call_indirect(X86Ctx *c, uint32_t target);
-void x86_unimpl(X86Ctx *c, uint32_t addr, const char *text);
-void trace_enter(X86Ctx *c, uint32_t va); /* entry of a function lifted with --trace */
-void x86_fault(X86Ctx *c, uint32_t addr, const char *why);
-double x86_ld80(uint32_t addr);
-void x86_st80(uint32_t addr, double v);
-uint64_t x86_rdtsc(void);
-void x86_out(X86Ctx *c, uint32_t port, uint32_t value, int bits);
-uint32_t x86_in(X86Ctx *c, uint32_t port, int bits);
-void x86_cpuid(X86Ctx *c);
+extern GAME_API uint8_t *g_mem;
+
+RT_API void x86_call_indirect(X86Ctx *c, uint32_t target);
+RT_API void x86_unimpl(X86Ctx *c, uint32_t addr, const char *text);
+RT_API void trace_enter(X86Ctx *c, uint32_t va); /* entry of a function lifted with --trace */
+RT_API void x86_fault(X86Ctx *c, uint32_t addr, const char *why);
+RT_API double x86_ld80(uint32_t addr);
+RT_API void x86_st80(uint32_t addr, double v);
+RT_API uint64_t x86_rdtsc(void);
+RT_API void x86_out(X86Ctx *c, uint32_t port, uint32_t value, int bits);
+RT_API uint32_t x86_in(X86Ctx *c, uint32_t port, int bits);
+RT_API void x86_cpuid(X86Ctx *c);
 
 /* ---- memory ---- */
 #define M8(a) (*(uint8_t *)(g_mem + (uint32_t)(a)))
@@ -60,11 +72,14 @@ void x86_cpuid(X86Ctx *c);
 #define MF32(a) (*(float *)(g_mem + (uint32_t)(a)))
 #define MF64(a) (*(double *)(g_mem + (uint32_t)(a)))
 #define MX(a) (*(Xmm *)(g_mem + (uint32_t)(a)))
+/* an Xmm (register or memory, any alignment) as a host __m128, for the lifter's packed SSE ops */
+#define XL(x) _mm_loadu_ps((x).f)
+#define XS(x, v) _mm_storeu_ps((x).f, (v))
 
 /* Driver code (lifted with MMIO_SECTIONS) uses these: device-register addresses go to the runtime so registers
  * can have side effects (write-1-to-clear, FIFO kick-off); everything else is a plain access. */
-uint32_t mmio_read(uint32_t addr, int bits);
-void mmio_write(uint32_t addr, uint32_t value, int bits);
+RT_API uint32_t mmio_read(uint32_t addr, int bits);
+RT_API void mmio_write(uint32_t addr, uint32_t value, int bits);
 #define IS_MMIO(a) ((uint32_t)(a) - 0xFD000000u < 0x01000000u)
 #define MR8(a) (IS_MMIO(a) ? (uint8_t)mmio_read((a), 8) : M8(a))
 #define MR16(a) (IS_MMIO(a) ? (uint16_t)mmio_read((a), 16) : M16(a))
@@ -83,8 +98,8 @@ void mmio_write(uint32_t addr, uint32_t value, int bits);
 
 /* Emitted on backward branches: if another thread wants the guest lock, hand it over (thread.c). Keeps tight
  * guest spin loops from starving the thread they are waiting for. */
-extern volatile long g_gil_waiters;
-void gil_yield(void);
+extern RT_API volatile long g_gil_waiters;
+RT_API void gil_yield(void);
 #define SAFEPOINT()                     \
     do {                                \
         if (g_gil_waiters) gil_yield(); \

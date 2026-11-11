@@ -3,13 +3,14 @@
  *
  * The recompiled game is made on the player's PC from their files; nothing of the game ships with the port. Build runs
  * the pipeline NOTES.md describes, each step a command whose output fills the details log:
+ *   first:     the build tools (g_tools: Python, capstone, zig), fetched and checked, into build\tools
  *   ISO only:  python tools\xiso_extract.py <iso> game
  *   always:    the game's Forza.xbe must be the one this port was made for (SHA-1 below)
- *   once:      python tools\find_functions.py, tools\oovpa_pp.bat, python tools\find_symbols.py (analysis\)
- *   always:    python tools\lift.py (recomp\), python tools\build.py (build\redline.exe)
- * It needs Python 3 with capstone, Pillow and numpy (it offers to install them with pip) and the Visual Studio C++
- * build tools (it says where to get them). launcher.ini next to it remembers the game. Everything is relative to the
- * launcher's own folder, the root of the port.
+ *   once:      python tools\find_functions.py, tools\oovpa_pp.py, tools\find_symbols.py (analysis\)
+ *   always:    python tools\lift.py (recomp\), python tools\build.py --zig (build\redline.exe, the runtime, and
+ *              build\forza_recomp.dll, the game code it loads)
+ * Nothing needs installing: the tools run from build\tools. launcher.ini next to it remembers the game. Everything is
+ * relative to the launcher's own folder, the root of the port.
  *
  * The window is drawn with Direct2D and DirectWrite (hence C++, written C-style): a dark page with the tachometer art,
  * one main action at a time (Build, then Play), a settings page for build\recomp.ini (the same settings as the
@@ -22,6 +23,8 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <bcrypt.h>
+#include <urlmon.h>
+#include <xinput.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <d2d1.h>
@@ -29,6 +32,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include "../runtime/version.h"
 
@@ -38,6 +42,8 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "xinput.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "d2d1.lib")
@@ -48,15 +54,39 @@
 #define WM_LOG (WM_APP + 1)  /* lParam: malloc'd text to append */
 #define WM_DONE (WM_APP + 2) /* wParam: 1 built */
 #define WM_STEP (WM_APP + 3) /* the build moved to another step */
+#define WM_UPDATE (WM_APP + 4) /* the update check found a newer release (g_update_*) */
+#define REPO "DivxPlays/redline-recompiled"
+
+/* The build's tools, fetched on the first Build from their makers' own downloads, checked against the SHA-256 pinned
+ * here and unpacked under build\tools: nothing is installed. capstone is the one package the Python tools need (the
+ * same version as the port was made with, so the lifted code is the same); zig is clang, lld and mingw-w64's headers,
+ * building with Windows' own C runtime (tools/build.py --zig). */
+static const struct {
+    const char *what, *url, *sha256, *dir, *check; /* check: a file the unpacked tool has */
+    int mb;
+} g_tools[] = {
+    {"Python 3.12.10 (embeddable)", "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip",
+     "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3", "build\\tools\\python-3.12.10",
+     "build\\tools\\python-3.12.10\\python.exe", 11},
+    {"capstone 5.0.7",
+     "https://files.pythonhosted.org/packages/70/39/2138d890a8e827636b9de9924fbc8527fe83e38b6d26605b30ac55e30ebe/"
+     "capstone-5.0.7-py3-none-win_amd64.whl",
+     "4ab8bcb7da8f221ff45926ca168ca33e76f7237d06fbf3c10780002faa2670e1", "build\\tools\\python-3.12.10",
+     "build\\tools\\python-3.12.10\\capstone\\__init__.py", 2},
+    {"zig 0.14.1 (the C compiler)", "https://ziglang.org/download/0.14.1/zig-x86_64-windows-0.14.1.zip",
+     "554f5378228923ffd558eac35e21af020c73789d87afeabf4bfd16f2e6feed2c", "build\\tools\\zig-0.14.1",
+     "build\\tools\\zig-0.14.1\\zig-x86_64-windows-0.14.1\\zig.exe", 82},
+};
+#define PYTHON "build\\tools\\python-3.12.10\\python.exe" /* run() starts commands in the root */
 
 static HWND g_wnd, g_log;
-static char g_root[MAX_PATH], g_ini[MAX_PATH], g_rini[MAX_PATH], g_source[MAX_PATH], g_python[64];
+static char g_root[MAX_PATH], g_ini[MAX_PATH], g_rini[MAX_PATH], g_source[MAX_PATH];
 static volatile LONG g_busy, g_cancel;
-static volatile HANDLE g_child; /* the step's process, for Cancel */
+static volatile HANDLE g_child; /* the step's job (its process tree), for Cancel */
 static int g_failed;            /* the last build stopped */
 static char g_fail_line[256];   /* its last log line that says why */
 static volatile LONG g_step;
-static const char *const g_step_names[] = {"Checking Python and the C++ build tools", "Extracting the disc image",
+static const char *const g_step_names[] = {"Getting the build tools", "Extracting the disc image",
                                            "Checking the game's files", "Finding the game's code",
                                            "Translating it to C", "Compiling"};
 #define STEPS 6
@@ -77,6 +107,22 @@ static void step(int n) {
     PostMessageA(g_wnd, WM_STEP, 0, 0);
 }
 
+/* what the step is doing now, under its name in the build card ("zig 0.14.1, 34 of 82 MB"); the build thread writes
+ * it, the window reads it */
+static SRWLOCK g_detail_lock = SRWLOCK_INIT;
+static char g_detail[96];
+static void set_detail(const char *s) {
+    AcquireSRWLockExclusive(&g_detail_lock);
+    snprintf(g_detail, sizeof g_detail, "%s", s);
+    ReleaseSRWLockExclusive(&g_detail_lock);
+    PostMessageA(g_wnd, WM_STEP, 0, 0);
+}
+static void get_detail(char *out, size_t n) {
+    AcquireSRWLockShared(&g_detail_lock);
+    snprintf(out, n, "%s", g_detail);
+    ReleaseSRWLockShared(&g_detail_lock);
+}
+
 static int is_iso(const char *p) {
     const char *dot = strrchr(p, '.');
     return dot && !_stricmp(dot, ".iso");
@@ -90,10 +136,177 @@ static void game_dir(char *out) {
 
 static int exists(const char *p) { return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES; }
 
-static int built(void) {
-    char exe[MAX_PATH];
-    snprintf(exe, sizeof exe, "%s\\build\\redline.exe", g_root);
-    return exists(exe) && g_source[0];
+/* ---------------- updates and what's new ---------------- */
+
+/* a whole file, 0-terminated (NULL if it cannot be read); the caller frees it */
+static char *read_all(const char *path, size_t limit) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    char *buf = (char *)malloc(limit + 1);
+    size_t n = buf ? fread(buf, 1, limit, f) : 0;
+    fclose(f);
+    if (buf) buf[n] = 0;
+    return buf;
+}
+
+/* "v1.2.3" or "1.2.3", comparable */
+static unsigned long long version_key(const char *v) {
+    unsigned a = 0, b = 0, c = 0;
+    if (*v == 'v' || *v == 'V') v++;
+    sscanf(v, "%u.%u.%u", &a, &b, &c);
+    return (unsigned long long)a << 40 | (unsigned long long)b << 20 | c;
+}
+
+/* the first string member `key` in some JSON, unescaped to UTF-8; NULL if there is none. The caller frees it. */
+static char *json_string(const char *json, const char *key) {
+    char pat[64];
+    snprintf(pat, sizeof pat, "\"%s\":", key);
+    const char *p = strstr(json, pat);
+    if (!p) return NULL;
+    for (p += strlen(pat); *p == ' '; p++) {}
+    if (*p++ != '"') return NULL;
+    char *out = (char *)malloc(strlen(p) + 1), *o = out;
+    while (out && *p && *p != '"') {
+        if (*p != '\\' || !p[1]) {
+            *o++ = *p++;
+            continue;
+        }
+        switch (*++p) {
+        case 'n': *o++ = '\n'; break;
+        case 't': *o++ = '\t'; break;
+        case 'r': break;
+        case 'u': {
+            unsigned u = 0;
+            if (sscanf(p + 1, "%4x", &u) == 1) p += 4;
+            if (u < 0x80) *o++ = (char)u;
+            else if (u < 0x800) *o++ = (char)(0xC0 | u >> 6), *o++ = (char)(0x80 | (u & 63));
+            else *o++ = (char)(0xE0 | u >> 12), *o++ = (char)(0x80 | (u >> 6 & 63)), *o++ = (char)(0x80 | (u & 63));
+            break;
+        }
+        default: *o++ = *p; /* \" \\ \/ */
+        }
+        p++;
+    }
+    if (out) *o = 0;
+    return out;
+}
+
+/* a newer release than this one, from GitHub (build\latest_release.json): shown at the top until the player updates */
+static char g_update_tag[32], *g_update_notes;
+static void update_from(const char *path) {
+    char *json = read_all(path, 1 << 20), *tag = json ? json_string(json, "tag_name") : NULL;
+    if (tag && version_key(tag) > version_key(RECOMP_VERSION) && !g_update_tag[0]) {
+        g_update_notes = json_string(json, "body");
+        snprintf(g_update_tag, sizeof g_update_tag, "%s", tag[0] == 'v' ? tag + 1 : tag); /* before the message */
+        PostMessageA(g_wnd, WM_UPDATE, 0, 0);
+    }
+    free(tag), free(json);
+}
+
+/* at most once a day, in the background: ask GitHub for the latest release. Offline, or anything wrong, it says
+ * nothing. Nothing is downloaded but the answer, and nothing installed: the player follows the link or not. */
+static DWORD WINAPI update_thread(void *arg) {
+    (void)arg;
+    char path[MAX_PATH], tmp[MAX_PATH], url[160], day[16];
+    snprintf(day, sizeof day, "%u", (unsigned)(time(NULL) / 86400));
+    snprintf(path, sizeof path, "%s\\build\\latest_release.json", g_root);
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    /* the day in the address: not yesterday's answer from Windows' download cache */
+    snprintf(url, sizeof url, "https://api.github.com/repos/" REPO "/releases/latest?day=%s", day);
+    CreateDirectoryA("build", NULL);
+    if (FAILED(URLDownloadToFileA(NULL, url, tmp, 0, NULL))) return 0;
+    MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
+    WritePrivateProfileStringA("launcher", "update_check_day", day, g_ini);
+    update_from(path);
+    return 0;
+}
+
+static void update_start(void) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%s\\build\\latest_release.json", g_root);
+    update_from(path); /* what the last check found */
+    if (GetPrivateProfileIntA("launcher", "update_check_day", 0, g_ini) != (int)(time(NULL) / 86400))
+        CloseHandle(CreateThread(NULL, 0, update_thread, NULL, 0, NULL));
+}
+
+static char *md_text(const char *md);
+
+/* the notes, and the release's page if the player wants it */
+static void update_offer(void) {
+    char head[256], *plain = g_update_notes ? md_text(g_update_notes) : NULL, *notes = plain ? plain : (char *)"";
+    snprintf(head, sizeof head, RECOMP_NAME " %s is out (you have " RECOMP_VERSION ").\n\n", g_update_tag);
+    size_t n = strlen(notes) > 1800 ? 1800 : strlen(notes);
+    char *msg = (char *)malloc(strlen(head) + n + 64);
+    if (!msg) {
+        free(plain);
+        return;
+    }
+    sprintf(msg, "%s%.*s%s\n\nOpen its download page?", head, (int)n, notes, n < strlen(notes) ? "\n..." : "");
+    int wn = MultiByteToWideChar(CP_UTF8, 0, msg, -1, NULL, 0);
+    wchar_t *w = (wchar_t *)malloc(wn * sizeof(wchar_t));
+    if (w && MultiByteToWideChar(CP_UTF8, 0, msg, -1, w, wn) &&
+        MessageBoxW(g_wnd, w, L"" RECOMP_NAME, MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+        char url[160];
+        snprintf(url, sizeof url, "https://github.com/" REPO "/releases/tag/v%s", g_update_tag);
+        ShellExecuteA(g_wnd, "open", url, NULL, NULL, SW_SHOWNORMAL);
+    }
+    free(w), free(msg), free(plain);
+}
+
+/* Markdown notes as plain lines, up to the first "## " heading after some text: "### Fixed" headings stand alone,
+ * "- " items get a bullet and their wrapped lines are joined; the changelog's "For the README" part (notes for the
+ * release itself) is left out. NULL if nothing is left. The caller frees it. */
+static char *md_text(const char *md) {
+    char *copy = _strdup(md), *out = (char *)malloc(strlen(md) * 2 + 1), *o = out;
+    int skip = 0;
+    for (char *line = copy; copy && out && line && *line;) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        size_t len = strlen(line);
+        if (len && line[len - 1] == '\r') line[--len] = 0;
+        if (!strncmp(line, "## ", 3)) {
+            if (o > out) break;
+        } else if (!strncmp(line, "### ", 4)) {
+            skip = !strcmp(line + 4, "For the README");
+            if (!skip) o += sprintf(o, "%s%s\n", o > out ? "\n" : "", line + 4);
+        } else if (skip || !len) {
+        } else if (!strncmp(line, "- ", 2)) {
+            o += sprintf(o, "\xE2\x80\xA2  %s\n", line + 2);
+        } else if (o > out && line[0] == ' ') { /* an item's wrapped line */
+            while (*line == ' ') line++;
+            o[-1] = ' ';
+            o += sprintf(o, "%s\n", line);
+        } else {
+            o += sprintf(o, "%s\n", line);
+        }
+        line = next;
+    }
+    free(copy);
+    if (out && o == out) free(out), out = NULL;
+    else if (out) *o = 0;
+    return out;
+}
+
+/* What's new: this version's part of CHANGELOG.md ("## 0.2.0 ..." to the next "## "); NULL if it has none */
+static char *whats_new(void) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%s\\CHANGELOG.md", g_root);
+    char *md = read_all(path, 1 << 20), *out = NULL;
+    for (char *p = md; p && (p = strstr(p, "\n## ")) != NULL; p++)
+        if (!strncmp(p + 4, RECOMP_VERSION, strlen(RECOMP_VERSION)) && (unsigned char)p[4 + strlen(RECOMP_VERSION)] <= ' ') {
+            char *body = strchr(p + 1, '\n'); /* past the "## 0.2.0 ..." line */
+            out = body ? md_text(body) : NULL;
+            break;
+        }
+    free(md);
+    return out;
+}
+static char *g_news; /* shown on page 2 the first start after an update */
+
+static int built(void) { /* the game code: the runtime (build\redline.exe) can come built, without it */
+    char dll[MAX_PATH];
+    snprintf(dll, sizeof dll, "%s\\build\\forza_recomp.dll", g_root);
+    return exists(dll) && g_source[0];
 }
 
 /* run cmd (through cmd.exe) in the root folder, its output to the log; returns its exit code */
@@ -113,12 +326,21 @@ static DWORD run(const char *cmd) {
     char line[4096];
     snprintf(line, sizeof line, "cmd /d /s /c \"%s\"", cmd);
     SetEnvironmentVariableA("PYTHONUNBUFFERED", "1");
-    if (!CreateProcessA(NULL, line, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, g_root, &si, &pi)) {
+    /* the step's whole process tree in a job, so Cancel ends what cmd started too (Python, tar, the compilers), not
+     * just cmd, while they ran on and the pipe kept the step waiting for them */
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (job) SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li);
+    if (!CreateProcessA(NULL, line, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, g_root, &si, &pi)) {
         CloseHandle(rd), CloseHandle(wr);
+        if (job) CloseHandle(job);
         post_log("cannot start: error %lu\r\n", GetLastError());
         return 1;
     }
-    g_child = pi.hProcess;
+    if (job) AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    g_child = job;
     CloseHandle(wr);
     char buf[1024], out[2100];
     DWORD n;
@@ -137,15 +359,17 @@ static DWORD run(const char *cmd) {
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess), CloseHandle(pi.hThread);
+    if (job) CloseHandle(job);
     return g_cancel ? 1 : code;
 }
 
-static int sha1_file(const char *path, char hex[41]) {
+/* a file's hash in lowercase hex (alg: BCRYPT_SHA1_ALGORITHM, 20 bytes; BCRYPT_SHA256_ALGORITHM, 32) */
+static int hash_file(const char *path, LPCWSTR alg_id, ULONG bytes, char *hex) {
     BCRYPT_ALG_HANDLE alg;
     BCRYPT_HASH_HANDLE h;
-    UCHAR digest[20];
+    UCHAR digest[32];
     FILE *f = fopen(path, "rb");
-    if (!f || BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM, NULL, 0)) {
+    if (!f || BCryptOpenAlgorithmProvider(&alg, alg_id, NULL, 0)) {
         if (f) fclose(f);
         return 0;
     }
@@ -154,42 +378,103 @@ static int sha1_file(const char *path, char hex[41]) {
     size_t n;
     while ((n = fread(buf, 1, sizeof buf, f)) > 0) BCryptHashData(h, buf, (ULONG)n, 0);
     fclose(f);
-    BCryptFinishHash(h, digest, 20, 0);
+    BCryptFinishHash(h, digest, bytes, 0);
     BCryptDestroyHash(h), BCryptCloseAlgorithmProvider(alg, 0);
-    for (int i = 0; i < 20; i++) sprintf(hex + 2 * i, "%02x", digest[i]);
+    for (ULONG i = 0; i < bytes; i++) sprintf(hex + 2 * i, "%02x", digest[i]);
     return 1;
 }
+static int sha1_file(const char *path, char hex[41]) { return hash_file(path, BCRYPT_SHA1_ALGORITHM, 20, hex); }
 
-static int have_python(void) { /* py -3 (the launcher Python installs) or python on PATH, with the packages */
-    static const char *const cands[] = {"py -3", "python"};
-    for (int i = 0; i < 2; i++) {
-        char cmd[128];
-        snprintf(cmd, sizeof cmd, "%s -c \"import sys; assert sys.version_info >= (3, 8)\" >nul 2>&1", cands[i]);
-        STARTUPINFOA si = {sizeof si};
-        PROCESS_INFORMATION pi;
-        char line[256];
-        snprintf(line, sizeof line, "cmd /d /s /c \"%s\"", cmd);
-        if (CreateProcessA(NULL, line, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, g_root, &si, &pi)) {
-            DWORD code = 1;
-            WaitForSingleObject(pi.hProcess, INFINITE);
-            GetExitCodeProcess(pi.hProcess, &code);
-            CloseHandle(pi.hProcess), CloseHandle(pi.hThread);
-            if (!code) {
-                snprintf(g_python, sizeof g_python, "%s", cands[i]);
-                return 1;
-            }
+/* URLDownloadToFile's callback: the download's progress in the build card, and Cancel stops it */
+struct DownloadProgress : IBindStatusCallback {
+    const char *what;
+    ULONG last_mb = ~0u;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **p) {
+        if (riid == IID_IUnknown || riid == IID_IBindStatusCallback) {
+            *p = this;
+            return S_OK;
         }
+        *p = NULL;
+        return E_NOINTERFACE;
     }
-    return 0;
-}
+    ULONG STDMETHODCALLTYPE AddRef() { return 1; } /* on fetch_tools' stack, for the call */
+    ULONG STDMETHODCALLTYPE Release() { return 1; }
+    HRESULT STDMETHODCALLTYPE OnProgress(ULONG done, ULONG total, ULONG, LPCWSTR) {
+        if (g_cancel) return E_ABORT;
+        if (done >> 20 != last_mb && total) {
+            char s[96];
+            last_mb = done >> 20;
+            snprintf(s, sizeof s, "%s, %lu of %lu MB", what, done >> 20, (total + (1 << 19)) >> 20);
+            set_detail(s);
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnStartBinding(DWORD, IBinding *) { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetPriority(LONG *) { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE OnLowResource(DWORD) { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnStopBinding(HRESULT, LPCWSTR) { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetBindInfo(DWORD *, BINDINFO *) { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDataAvailable(DWORD, DWORD, FORMATETC *, STGMEDIUM *) { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnObjectAvailable(REFIID, IUnknown *) { return S_OK; }
+};
 
-static int have_msvc(void) {
-    char vswhere[MAX_PATH];
-    ExpandEnvironmentStringsA("%ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\vswhere.exe", vswhere, MAX_PATH);
-    char cmd[512];
-    snprintf(cmd, sizeof cmd, "\"%s\" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 "
-             "-find VC\\Auxiliary\\Build\\vcvars64.bat | findstr vcvars64 >nul", vswhere);
-    return exists(vswhere) && run(cmd) == 0;
+/* g_tools, each fetched once: download, check, unpack with Windows' tar. A tool counts as there by its .ok file,
+ * written only once it unpacked whole (Cancel during the unpacking leaves its files but no .ok, so the next Build
+ * fetches it again) */
+static int fetch_tools(void) {
+    char check[MAX_PATH], ok[MAX_PATH + 4], dir[MAX_PATH], zip[MAX_PATH], tar[MAX_PATH], hex[65], cmd[MAX_PATH * 3];
+    ExpandEnvironmentStringsA("%SystemRoot%\\System32\\tar.exe", tar, MAX_PATH); /* not a tar from Git, which cannot unzip */
+    for (size_t i = 0; i < sizeof g_tools / sizeof g_tools[0]; i++) {
+        snprintf(check, sizeof check, "%s\\%s", g_root, g_tools[i].check);
+        snprintf(ok, sizeof ok, "%s.ok", check);
+        if (exists(ok)) continue;
+        if (strlen(g_root) > 120) { /* zig's deepest file is 114 characters below build\tools\zig-0.14.1 */
+            post_log("This folder's path is too long for the build tools (%u characters, 120 at most). Move the port to a "
+                     "shorter one, such as C:\\Games\\RedlineRecompiled, then press Build again.\r\n", (unsigned)strlen(g_root));
+            return 0;
+        }
+        snprintf(dir, sizeof dir, "%s\\%s", g_root, g_tools[i].dir);
+        SHCreateDirectoryExA(NULL, dir, NULL);
+        snprintf(zip, sizeof zip, "%s\\download.zip", dir);
+        post_log("Downloading %s, %d MB: %s\r\n", g_tools[i].what, g_tools[i].mb, g_tools[i].url);
+        DownloadProgress progress;
+        progress.what = g_tools[i].what;
+        HRESULT hr = URLDownloadToFileA(NULL, g_tools[i].url, zip, 0, &progress);
+        set_detail("");
+        if (g_cancel) {
+            DeleteFileA(zip);
+            return 0;
+        }
+        if (FAILED(hr)) {
+            post_log("The download failed (error %08lX). Check the internet connection, then press Build again.\r\n", hr);
+            return 0;
+        }
+        if (!hash_file(zip, BCRYPT_SHA256_ALGORITHM, 32, hex) || strcmp(hex, g_tools[i].sha256)) {
+            DeleteFileA(zip);
+            post_log("%s did not match its checksum, so it was not used (a broken download, or not the file it should "
+                     "be). Press Build to try again.\r\n", g_tools[i].what);
+            return 0;
+        }
+        snprintf(cmd, sizeof cmd, "\"%s\" -xf \"%s\" -C \"%s\"", tar, zip, dir);
+        set_detail("unpacking");
+        DWORD code = run(cmd);
+        set_detail("");
+        DeleteFileA(zip);
+        if (code || !exists(check)) {
+            if (!g_cancel) post_log("Unpacking %s failed.\r\n", g_tools[i].what);
+            return 0;
+        }
+        FILE *mark = fopen(ok, "w");
+        if (mark) fclose(mark);
+    }
+    /* the embeddable Python finds modules only where its ._pth says: its own folder (capstone) and tools\ */
+    snprintf(check, sizeof check, "%s\\build\\tools\\python-3.12.10\\python312._pth", g_root);
+    FILE *f = fopen(check, "w");
+    if (!f) return 0;
+    fputs("python312.zip\n.\n../../../tools\n", f);
+    fclose(f);
+    post_log("The build tools are ready (build\\tools).\r\n");
+    return 1;
 }
 
 static DWORD WINAPI build_thread(void *arg) {
@@ -199,30 +484,13 @@ static DWORD WINAPI build_thread(void *arg) {
     game_dir(game);
     snprintf(xbe, sizeof xbe, "%s\\Forza.xbe", game);
     step(0);
-    if (!have_python()) {
-        post_log("Python 3 was not found. Install it from https://www.python.org/downloads/ (tick \"Add python.exe to "
-                 "PATH\"), then press Build again.\r\n");
-        goto done;
-    }
-    snprintf(cmd, sizeof cmd, "%s -c \"import capstone, PIL, numpy\"", g_python);
-    if (run(cmd)) {
-        if (g_cancel || MessageBoxA(g_wnd, "The build needs the Python packages capstone, Pillow and numpy. Install them now "
-                                           "with pip?", RECOMP_NAME, MB_YESNO | MB_ICONQUESTION) != IDYES)
-            goto done;
-        snprintf(cmd, sizeof cmd, "%s -m pip install --user capstone pillow numpy", g_python);
-        if (run(cmd)) goto done;
-    }
-    if (!have_msvc()) {
-        post_log("The Visual Studio C++ build tools were not found. Install \"Desktop development with C++\" from "
-                 "https://visualstudio.microsoft.com/visual-cpp-build-tools/ then press Build again.\r\n");
-        goto done;
-    }
+    if (!fetch_tools()) goto done;
     if (is_iso(g_source)) {
         step(1);
         char have[41] = "";
         if (!exists(xbe) || !sha1_file(xbe, have) || strcmp(have, XBE_SHA1)) {
             post_log("Extracting the ISO (3.6 GB)...\r\n");
-            snprintf(cmd, sizeof cmd, "%s tools\\xiso_extract.py \"%s\" game", g_python, g_source);
+            snprintf(cmd, sizeof cmd, "%s tools\\xiso_extract.py \"%s\" game", PYTHON, g_source);
             if (run(cmd)) goto done;
         }
     }
@@ -239,21 +507,21 @@ static DWORD WINAPI build_thread(void *arg) {
     step(3);
     CreateDirectoryA("analysis", NULL);
     if (!exists("analysis\\Forza.functions.json")) {
-        snprintf(cmd, sizeof cmd, "%s tools\\find_functions.py \"%s\" analysis\\Forza.functions.json", g_python, xbe);
+        snprintf(cmd, sizeof cmd, "%s tools\\find_functions.py \"%s\" analysis\\Forza.functions.json", PYTHON, xbe);
         if (run(cmd)) goto done;
     }
     if (!exists("analysis\\Forza.symbols.json")) {
-        if (run("tools\\oovpa_pp.bat")) goto done;
+        if (run(PYTHON " tools\\oovpa_pp.py")) goto done;
         snprintf(cmd, sizeof cmd, "%s tools\\find_symbols.py \"%s\" build\\oovpa third_party\\nxdk\\xboxkrnl.exe.def "
-                 "analysis\\Forza.symbols.json", g_python, xbe);
+                 "analysis\\Forza.symbols.json", PYTHON, xbe);
         if (run(cmd)) goto done;
     }
     step(4);
     snprintf(cmd, sizeof cmd, "%s tools\\lift.py \"%s\" analysis\\Forza.functions.json recomp --hle runtime\\hle.txt "
-             "--symbols analysis\\Forza.symbols.json", g_python, xbe);
+             "--symbols analysis\\Forza.symbols.json", PYTHON, xbe);
     if (run(cmd)) goto done;
     step(5);
-    snprintf(cmd, sizeof cmd, "%s tools\\build.py", g_python);
+    snprintf(cmd, sizeof cmd, "%s tools\\build.py --zig", PYTHON);
     if (run(cmd)) goto done;
     post_log("\r\nDone: press Play.\r\n");
     ok = 1;
@@ -273,7 +541,7 @@ static void start_build(void) {
 static void cancel_build(void) {
     InterlockedExchange(&g_cancel, 1);
     HANDLE h = g_child;
-    if (h) TerminateProcess(h, 1);
+    if (h) TerminateJobObject(h, 1);
 }
 
 /* a dropped or chosen ISO or folder; returns 0 (and says why) when it is neither */
@@ -298,7 +566,9 @@ static void choose(int iso) {
         ofn.lpstrFilter = "Xbox disc image (*.iso)\0*.iso\0All files\0*.*\0";
         ofn.lpstrFile = path;
         ofn.nMaxFile = MAX_PATH;
-        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        /* NOCHANGEDIR: the dialog would make the ISO's folder our current one, and the build's analysis\ went there
+         * while its steps run in the root (GitHub #5, #9) */
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
         if (!GetOpenFileNameA(&ofn)) return;
     } else {
         BROWSEINFOA bi = {g_wnd};
@@ -403,15 +673,16 @@ static ID2D1HwndRenderTarget *g_rt;
 static IDWriteTextFormat *g_f_head, *g_f_sub, *g_f_body, *g_f_btn, *g_f_btn_big, *g_f_small, *g_f_logo, *g_f_logo2,
     *g_f_pct, *g_f_label;
 static float g_dpi = 96;
-static int g_page;      /* 0 main, 1 settings */
+static int g_page;      /* 0 main, 1 settings, 2 what's new */
 static int g_details;   /* the build's log shown */
 static int g_hover = -1, g_press = -1;
+static int g_focus = -1, g_pad_mode; /* the gamepad's or keyboard's item, and whether its ring shows (pad_poll) */
 static ULONGLONG g_anim; /* GetTickCount64 at start, for the progress shimmer */
 
 /* clickable things: ids; the rectangles of this frame (DIPs) */
 enum {
     B_ISO = 1, B_FOLDER, B_BUILD, B_PLAY, B_SETTINGS, B_DETAILS, B_CANCEL, B_DONE, B_SAVES, B_LOGS, B_GAME, B_REBUILD,
-    B_CHANGE, B_SET0 = 100 /* + setting: its value; + 50: its left arrow */
+    B_CHANGE, B_UPDATE, B_CHANGELOG, B_SET0 = 100 /* + setting: its value; + 50: its left arrow */
 };
 typedef struct {
     int id;
@@ -599,9 +870,10 @@ static void draw_main(float w, float h, float x0, float top) {
         D2D1_RECT_F card = D2D1::RectF(x0, top + 124, x0 + cw, top + 124 + 150);
         rounded(card, 14, rgb(0xFFFFFF, 0.045f), rgb(0xFFFFFF, 0.08f));
         int s = g_step;
-        char pct[16], what[128];
+        char pct[16], what[256], detail[96];
         snprintf(pct, sizeof pct, "%d%%", s * 100 / STEPS);
-        snprintf(what, sizeof what, "%s  (step %d of %d)", g_step_names[s], s + 1, STEPS);
+        get_detail(detail, sizeof detail);
+        snprintf(what, sizeof what, "%s%s%s  (step %d of %d)", g_step_names[s], detail[0] ? ": " : "", detail, s + 1, STEPS);
         text(pct, g_f_pct, D2D1::RectF(card.left + 24, card.top + 16, card.left + 200, card.top + 66), C_TEXT);
         text(what, g_f_body, D2D1::RectF(card.left + 24, card.top + 68, card.right - 24, card.top + 92), C_MUTED);
         D2D1_RECT_F bar = D2D1::RectF(card.left + 24, card.top + 104, card.right - 24, card.top + 110);
@@ -673,7 +945,7 @@ static void draw_main(float w, float h, float x0, float top) {
     button(B_BUILD, g_failed ? "Try again" : "Build", D2D1::RectF(x0, card.bottom + 24, x0 + 220, card.bottom + 80), 0,
            g_source[0] != 0, g_f_btn_big);
     if (g_failed) button(B_DETAILS, g_details ? "Hide details" : "Show details", D2D1::RectF(x0 + 236, card.bottom + 38, x0 + 360, card.bottom + 66), 2);
-    else text("Needs Python 3 and the Visual Studio C++ build tools; the launcher checks and says where to get them.",
+    else text("Nothing to install. The first build downloads its tools (about 95 MB) and the upscalers.",
               g_f_small, D2D1::RectF(x0 + 240, card.bottom + 24, x0 + 900, card.bottom + 80), C_FAINT);
 }
 
@@ -697,9 +969,32 @@ static void draw_settings(float w, float h, float x0, float top) {
         text(g_settings[i].names[setting_index(i)], g_f_label, val, C_TEXT, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
         text("\xE2\x80\xB9", g_f_label, D2D1::RectF(val.left + 6, val.top, val.left + 26, val.bottom), C_MUTED, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
         text("\xE2\x80\xBA", g_f_label, D2D1::RectF(val.right - 26, val.top, val.right - 6, val.bottom), C_MUTED, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
-        hit(id + 50, D2D1::RectF(val.left, val.top, val.left + 40, val.bottom)); /* the left arrow goes back */
         hit(id, val);
+        hit(id + 50, D2D1::RectF(val.left, val.top, val.left + 40, val.bottom)); /* the left arrow goes back: after val,
+                                                                                    since hit_test takes the last */
     }
+}
+
+static const Hit *hit_of(int id); /* the gamepad's focus (below) */
+static void focus_default(void);
+
+/* page 2: this version's changes, once, the first start after an update (g_news) */
+static void draw_news(float w, float h, float x0) {
+    float top = 96, cw = w - x0 * 2 > 760 ? 760 : w - x0 * 2;
+    text("What's new in " RECOMP_VERSION, g_f_head, D2D1::RectF(x0, top, x0 + cw - 160, top + 64), C_TEXT);
+    button(B_DONE, "Done", D2D1::RectF(x0 + cw - 140, top + 12, x0 + cw, top + 56), 0);
+    D2D1_RECT_F card = D2D1::RectF(x0, top + 84, x0 + cw, h - 104);
+    rounded(card, 14, rgb(0x0E0A0B, 0.92f), rgb(0xFFFFFF, 0.08f));
+    int n = MultiByteToWideChar(CP_UTF8, 0, g_news, -1, NULL, 0);
+    wchar_t *wt = (wchar_t *)malloc(n * sizeof(wchar_t));
+    if (wt && MultiByteToWideChar(CP_UTF8, 0, g_news, -1, wt, n)) {
+        g_f_body->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_f_body->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR); /* text() sets it back for the rest */
+        g_rt->DrawText(wt, n - 1, g_f_body, D2D1::RectF(card.left + 24, card.top + 18, card.right - 24, card.bottom - 14),
+                       brush(rgb(C_TEXT)), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+    free(wt);
+    button(B_CHANGELOG, "Every change: CHANGELOG.md", D2D1::RectF(x0, h - 100, x0 + 230, h - 60), 2);
 }
 
 static void draw(void) {
@@ -710,14 +1005,22 @@ static void draw(void) {
     float w = sz.width, h = sz.height, x0 = w > 1000 ? 72.0f : 40.0f;
     backdrop(w, h);
     logo(x0, 28);
+    if (g_update_tag[0]) { /* a newer release: the notes and its page on a click (update_offer) */
+        char msg[96];
+        snprintf(msg, sizeof msg, "Version %s is out: see what's new", g_update_tag);
+        float tw = text_width(msg, g_f_label) + 24;
+        D2D1_RECT_F r = D2D1::RectF(w - x0 - tw, 22, w - x0, 54);
+        rounded(r, 8, rgb(C_AMBER, g_hover == B_UPDATE ? 0.22f : 0.12f), rgb(C_AMBER, 0.5f));
+        text(msg, g_f_label, r, C_AMBER, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+        hit(B_UPDATE, r);
+    }
     float top = h * 0.24f < 150 ? 150 : h * 0.24f;
     if (g_page == 1) draw_settings(w, h, x0, top);
+    else if (g_page == 2 && g_news) draw_news(w, h, x0);
     else draw_main(w, h, x0, top);
     /* the footer */
     g_rt->FillRectangle(D2D1::RectF(0, h - 48, w, h), brush(rgb(0x070506, 0.92f)));
     g_rt->DrawLine(D2D1::Point2F(0, h - 48), D2D1::Point2F(w, h - 48), brush(rgb(0xFFFFFF, 0.06f)), 1);
-    text(RECOMP_NAME " " RECOMP_VERSION "  \xC2\xB7  Not affiliated with Microsoft or Turn 10 Studios", g_f_small,
-         D2D1::RectF(x0, h - 48, x0 + 600, h), C_FAINT);
     static const struct {
         int id;
         const char *label;
@@ -728,6 +1031,15 @@ static void draw(void) {
         float tw = text_width(links[i].label, g_f_small) + 20;
         button(links[i].id, links[i].label, D2D1::RectF(x - tw, h - 46, x, h - 2), 2);
         x -= tw + 8;
+    }
+    /* up to the links (it wraps in a narrow window rather than run under them) */
+    text(RECOMP_NAME " " RECOMP_VERSION "  \xC2\xB7  Made with the help of AI  \xC2\xB7  Not affiliated with Microsoft or "
+         "Turn 10 Studios", g_f_small, D2D1::RectF(x0, h - 48, x - 8, h), C_FAINT);
+    if (g_pad_mode) { /* the gamepad's or keyboard's item: a ring round it (a page change moves it to the main action) */
+        if (!hit_of(g_focus)) focus_default();
+        const Hit *f = hit_of(g_focus);
+        if (f) rounded(D2D1::RectF(f->r.left - 4, f->r.top - 4, f->r.right + 4, f->r.bottom + 4), 12, rgb(0, 0),
+                       rgb(0xFFFFFF, 0.92f), 2.5f);
     }
     if (g_rt->EndDraw() == (HRESULT)D2DERR_RECREATE_TARGET) g_brush->Release(), g_rt->Release(), g_brush = NULL, g_rt = NULL;
 }
@@ -765,6 +1077,13 @@ static void click(int id) {
     case B_DONE: g_page = 0; break;
     case B_DETAILS: g_details ^= 1; break;
     case B_CANCEL: cancel_build(); break;
+    case B_UPDATE: update_offer(); break;
+    case B_CHANGELOG: {
+        char p[MAX_PATH];
+        snprintf(p, sizeof p, "%s\\CHANGELOG.md", g_root);
+        ShellExecuteA(g_wnd, "open", p, NULL, NULL, SW_SHOWNORMAL);
+        break;
+    }
     case B_SAVES: {
         char game[MAX_PATH], p[MAX_PATH * 2];
         game_dir(game);
@@ -792,6 +1111,107 @@ static int hit_test(LPARAM lp) {
     for (int i = g_nhits - 1; i >= 0; i--)
         if (x >= g_hits[i].r.left && x < g_hits[i].r.right && y >= g_hits[i].r.top && y < g_hits[i].r.bottom) return g_hits[i].id;
     return -1;
+}
+
+/* ---------------- a gamepad or the keyboard (#13: the launcher with a controller alone) ----------------
+ * A focus ring moves over what can be clicked (the d-pad, the left stick, the arrow keys); A or Enter clicks it,
+ * B or Esc goes back. On a setting, left and right step its value. The mouse hides the ring. */
+static const Hit *hit_of(int id) {
+    for (int i = g_nhits - 1; i >= 0; i--)
+        if (g_hits[i].id == id) return &g_hits[i];
+    return NULL;
+}
+static int navigable(int id) { return id < B_SET0 + 50; } /* not a setting's left arrow: left and right step it */
+
+static void focus_default(void) { /* the page's main action, else its first item */
+    static const int first[] = {B_PLAY, B_BUILD, B_DONE};
+    for (int i = 0; i < 3; i++)
+        if (hit_of(first[i])) {
+            g_focus = first[i];
+            return;
+        }
+    for (int i = 0; i < g_nhits; i++)
+        if (navigable(g_hits[i].id)) {
+            g_focus = g_hits[i].id;
+            return;
+        }
+}
+
+/* to the nearest item whose middle lies that way from the focused one's, sideways distance counting double */
+static void focus_move(int dx, int dy) {
+    const Hit *f = hit_of(g_focus);
+    if (!f) {
+        focus_default();
+        return;
+    }
+    float fx = (f->r.left + f->r.right) / 2, fy = (f->r.top + f->r.bottom) / 2, best_score = 1e30f;
+    int best = -1;
+    for (int i = 0; i < g_nhits; i++) {
+        const Hit *c = &g_hits[i];
+        if (c->id == g_focus || !navigable(c->id)) continue;
+        float ox = (c->r.left + c->r.right) / 2 - fx, oy = (c->r.top + c->r.bottom) / 2 - fy;
+        float along = ox * dx + oy * dy, side = fabsf(ox * dy) + fabsf(oy * dx);
+        if (along > 1 && along + 2 * side < best_score) best_score = along + 2 * side, best = c->id;
+    }
+    if (best >= 0) g_focus = best;
+}
+
+static void pad_nav(int dx, int dy) {
+    int shown = g_pad_mode && hit_of(g_focus);
+    g_pad_mode = 1;
+    if (!shown) focus_default(); /* the first press shows where the ring is */
+    else if (dx && g_page == 1 && g_focus >= B_SET0 && g_focus < B_SET0 + 50) setting_cycle(g_focus - B_SET0, dx);
+    else focus_move(dx, dy);
+    InvalidateRect(g_wnd, NULL, FALSE);
+}
+static void pad_choose(void) {
+    int shown = g_pad_mode && hit_of(g_focus);
+    g_pad_mode = 1;
+    if (!shown) focus_default();
+    else click(g_focus);
+    InvalidateRect(g_wnd, NULL, FALSE);
+}
+static void pad_back(void) { /* never Cancel: a build stops only on purpose */
+    g_pad_mode = 1;
+    if (g_page) g_page = 0;
+    else if (g_details && !g_busy) g_details = 0, place_log();
+    InvalidateRect(g_wnd, NULL, FALSE);
+}
+
+/* the first connected pad, each timer tick: presses, and a held direction repeating after 0.4 s every 0.12 s */
+static void pad_poll(void) {
+    static DWORD slot, next_scan;
+    static WORD last;
+    static ULONGLONG repeat_at;
+    XINPUT_STATE st;
+    WORD b = 0;
+    if (XInputGetState(slot, &st) != ERROR_SUCCESS) {
+        if (GetTickCount() < next_scan) return; /* an empty slot is slow to ask: look for a pad twice a second */
+        next_scan = GetTickCount() + 500;
+        for (slot = 0; slot < 4 && XInputGetState(slot, &st) != ERROR_SUCCESS; slot++) {}
+        if (slot == 4) {
+            slot = 0, last = 0;
+            return;
+        }
+    }
+    b = st.Gamepad.wButtons;
+    const SHORT dead = 16000; /* the stick as a d-pad */
+    if (st.Gamepad.sThumbLX < -dead) b |= XINPUT_GAMEPAD_DPAD_LEFT;
+    if (st.Gamepad.sThumbLX > dead) b |= XINPUT_GAMEPAD_DPAD_RIGHT;
+    if (st.Gamepad.sThumbLY > dead) b |= XINPUT_GAMEPAD_DPAD_UP;
+    if (st.Gamepad.sThumbLY < -dead) b |= XINPUT_GAMEPAD_DPAD_DOWN;
+    const WORD dirs = XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT;
+    WORD down = b & ~last;
+    ULONGLONG now = GetTickCount64();
+    if (down & dirs) repeat_at = now + 400;
+    else if ((b & dirs) && (b & dirs) == (last & dirs) && now >= repeat_at) down |= b & dirs, repeat_at = now + 120;
+    last = b;
+    if (down & XINPUT_GAMEPAD_DPAD_UP) pad_nav(0, -1);
+    if (down & XINPUT_GAMEPAD_DPAD_DOWN) pad_nav(0, 1);
+    if (down & XINPUT_GAMEPAD_DPAD_LEFT) pad_nav(-1, 0);
+    if (down & XINPUT_GAMEPAD_DPAD_RIGHT) pad_nav(1, 0);
+    if (down & XINPUT_GAMEPAD_A) pad_choose();
+    if (down & XINPUT_GAMEPAD_B) pad_back();
 }
 
 static HBRUSH g_log_brush;
@@ -825,6 +1245,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE: {
+        static LPARAM last_pos = -1;
+        if (lp != last_pos && last_pos != -1 && g_pad_mode) g_pad_mode = 0, InvalidateRect(h, NULL, FALSE); /* the mouse again */
+        last_pos = lp;
         int id = hit_test(lp);
         if (id != g_hover) g_hover = id, InvalidateRect(h, NULL, FALSE);
         TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, h, 0};
@@ -862,7 +1285,20 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_TIMER:
         if (g_busy) InvalidateRect(h, NULL, FALSE);
+        if (GetForegroundWindow() == h) pad_poll(); /* not a pad meant for the game or another window */
         return 0;
+    case WM_KEYDOWN: /* the keyboard moves the same focus */
+        switch (wp) {
+        case VK_UP: pad_nav(0, -1); return 0;
+        case VK_DOWN: pad_nav(0, 1); return 0;
+        case VK_LEFT: pad_nav(-1, 0); return 0;
+        case VK_RIGHT: pad_nav(1, 0); return 0;
+        case VK_RETURN:
+        case VK_SPACE: pad_choose(); return 0;
+        case VK_ESCAPE:
+        case VK_BACK: pad_back(); return 0;
+        }
+        break;
     case WM_LOG: {
         char *t = (char *)lp;
         int len = GetWindowTextLengthA(g_log);
@@ -875,7 +1311,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         free(t);
         return 0;
     }
-    case WM_STEP: InvalidateRect(h, NULL, FALSE); return 0;
+    case WM_STEP:
+    case WM_UPDATE: InvalidateRect(h, NULL, FALSE); return 0;
     case WM_DONE:
         InterlockedExchange(&g_busy, 0);
         g_failed = !wp && !g_cancel;
@@ -910,6 +1347,14 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     snprintf(g_rini, sizeof g_rini, "%s\\build\\recomp.ini", g_root);
     GetPrivateProfileStringA("launcher", "game", "", g_source, MAX_PATH, g_ini);
     if (!g_source[0] && exists("game\\Forza.xbe")) GetFullPathNameA("game", MAX_PATH, g_source, NULL);
+    { /* the first start of this version: what's new, if it came over an older one (launcher.ini there already) */
+        char seen[32];
+        GetPrivateProfileStringA("launcher", "seen_version", "", seen, sizeof seen, g_ini);
+        if (strcmp(seen, RECOMP_VERSION)) {
+            if (exists(g_ini) && (g_news = whats_new())) g_page = 2;
+            WritePrivateProfileStringA("launcher", "seen_version", RECOMP_VERSION, g_ini);
+        }
+    }
 
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2d);
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown **)&g_dw);
@@ -954,6 +1399,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     SetTimer(g_wnd, 1, 33, NULL);
     place_log();
     ShowWindow(g_wnd, show);
+    update_start();
     MSG m;
     while (GetMessageA(&m, NULL, 0, 0) > 0) {
         TranslateMessage(&m);

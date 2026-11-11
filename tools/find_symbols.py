@@ -1,6 +1,6 @@
 """Name XDK library functions in an XBE using XbSymbolDatabase signatures (MIT code, ODbL data).
 
-Input is the database's *_OOVPA.c tables run through a C preprocessor (see tools/oovpa_pp.bat), so every macro
+Input is the database's *_OOVPA.c tables run through a C preprocessor (see tools/oovpa_pp.py), so every macro
 and #if is already resolved. Matching follows the reference scanner: per symbol take the highest signature
 revision <= the library version; a match needs every (offset, byte) pair and every XREF to agree (an XREF is a
 4-byte absolute or PC-relative reference to another symbol). XREFs marked "derive" are learned from the first

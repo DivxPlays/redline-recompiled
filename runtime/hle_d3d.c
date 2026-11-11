@@ -12,7 +12,7 @@ static void ret(X86Ctx *c, uint32_t value, int n) {
     c->esp += 4 + 4 * n;
 }
 
-void o_003C2A52(X86Ctx *c); /* lifted original */
+extern GuestFn o_003C2A52; /* lifted original */
 
 /* CMiniport::CreateCtxDmaObject(id, class, base, limit, pObject) (thiscall): tell the push buffer interpreter
  * where each DMA context points, then run the original. Class 0x3D is an in-memory DMA object. D3D sizes its

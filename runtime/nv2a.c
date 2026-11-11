@@ -55,7 +55,7 @@ static int g_gpu_threaded = -1;
 static HANDLE g_gpu_wake; /* auto-reset: PUT moved, or a stall resumed */
 static SRWLOCK g_gpu_lock = SRWLOCK_INIT, g_flip_lock = SRWLOCK_INIT;
 static volatile LONG g_gpu_wanted;
-static __declspec(thread) int t_gpu_depth; /* gpu_enter nests */
+static THREAD_LOCAL int t_gpu_depth; /* gpu_enter nests */
 static void run(void);
 static LONGLONG g_push_ticks; /* QPC time spent running the push buffer, for FPSLOG */
 

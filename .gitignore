@@ -12,3 +12,34 @@ hdd/
 /third_party/fsr/
 /third_party/dlss/
 /dist/
+
+# added by the Claude starter kit
+.env
+.env.*
+!.env.example
+api_key.txt
+*.pem
+*.key
+*.xex
+*.xbe
+*.chd
+*.cso
+*.nsp
+*.xci
+*.wbfs
+*.rvz
+*.log
+Thumbs.db
+.DS_Store
+.claude/settings.local.json
+
+# added by the Claude starter kit
+!.env.example
+build/clean-pc/
+build/linux-test/
+build/android-test/
+build/ios-test/
+
+# added by the Claude starter kit
+!.env.example
+build/release-report.*

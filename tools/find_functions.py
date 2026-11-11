@@ -7,6 +7,7 @@ Usage: python tools/find_functions.py <file.xbe> <out.json>
 """
 import collections
 import json
+import os
 import re
 import sys
 
@@ -253,6 +254,7 @@ def main(xbe, out):
     print(f"jump tables: {sum(len(f['jump_tables']) for f in funcs.values())}, "
           f"unresolved indirect jmp/call sites: {sum(len(f['unresolved_indirect']) for f in funcs.values())}")
     print("functions per section:", dict(by_section.most_common()))
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     json.dump([funcs[k] for k in sorted(funcs)], open(out, "w"))
 
 

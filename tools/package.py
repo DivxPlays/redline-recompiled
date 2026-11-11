@@ -1,6 +1,7 @@
 """The release zip, dist/RedlineRecompiled-<version>.zip: the committed tree (git archive HEAD) and the launcher, built
-fresh, in a RedlineRecompiled-<version> folder. Nothing of the game, the generated code or the build is in it (all
-git-ignored); players build those from their own disc with the launcher.
+fresh, with no folder inside, so unzipping a new version into the player's folder updates it in place (a
+RedlineRecompiled-<version> folder made a second copy beside the old one, without its saves). Nothing of the game,
+the generated code or the build is in it (all git-ignored); players build those from their own disc with the launcher.
 
 Usage: python tools/package.py
 
@@ -28,7 +29,7 @@ def main():
     name = f"RedlineRecompiled-{version}"
     os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
     out = os.path.join(ROOT, "dist", name + ".zip")
-    git("archive", "--format=zip", f"--prefix={name}/", "--add-file=RedlineLauncher.exe", "-o", out, "HEAD")
+    git("archive", "--format=zip", "--add-file=RedlineLauncher.exe", "-o", out, "HEAD")
 
     private = [s for s in (git("log", "-1", "--format=%ae"), os.path.expanduser("~")) if s]
     with zipfile.ZipFile(out) as z:

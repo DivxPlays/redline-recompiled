@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(**/api_key.txt)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)"
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "node .claude/statusline.js"
+  }
+}

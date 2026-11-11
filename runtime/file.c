@@ -150,6 +150,7 @@ static uint32_t open_file(X86Ctx *c, uint32_t out_handle, uint32_t access, uint3
                           uint32_t disposition, uint32_t options) {
     char guest[GPATH], host[MAX_PATH];
     guest_path(oa, guest);
+    achieve_file(guest, (access & 0x40000006u) != 0 || disposition != 1); /* GENERIC_WRITE, FILE_WRITE/APPEND_DATA */
     int dev = host_path(guest, host);
     if (!dev) {
         fprintf(stderr, "[file] unknown device in %s\n", guest);

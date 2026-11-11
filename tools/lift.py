@@ -558,16 +558,16 @@ class Lifter:
                   "sqrtss": "sqrtf({s})", "rsqrtss": "1.0f / sqrtf({s})", "rcpss": "1.0f / {s}"}
         if m in scalar:
             return [f"{x(0)}.f[0] = {scalar[m].format(d=f'{x(0)}.f[0]', s=src_f(1))};"]
-        packed = {"addps": "{d} + {s}", "subps": "{d} - {s}", "mulps": "{d} * {s}", "divps": "{d} / {s}",
-                  "minps": "({d} < {s} ? {d} : {s})", "maxps": "({d} > {s} ? {d} : {s})",
-                  "sqrtps": "sqrtf({s})", "rsqrtps": "1.0f / sqrtf({s})", "rcpps": "1.0f / {s}"}
+        # one host SSE op each, the same lane math: a loop over the 4 lanes per instruction made cl need 65 GB for the
+        # long SSE blocks in funcs_039.c (GitHub #2, #3, #8, #16). rsqrtps/rcpps stay exact, as before (the host's
+        # approximations differ between CPUs)
+        packed = {"addps": "_mm_add_ps(d, s)", "subps": "_mm_sub_ps(d, s)", "mulps": "_mm_mul_ps(d, s)",
+                  "divps": "_mm_div_ps(d, s)", "minps": "_mm_min_ps(d, s)", "maxps": "_mm_max_ps(d, s)",
+                  "sqrtps": "_mm_sqrt_ps(s)", "rsqrtps": "_mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(s))",
+                  "rcpps": "_mm_div_ps(_mm_set1_ps(1.0f), s)", "andps": "_mm_and_ps(d, s)", "orps": "_mm_or_ps(d, s)",
+                  "xorps": "_mm_xor_ps(d, s)", "andnps": "_mm_andnot_ps(d, s)"}
         if m in packed:
-            e = packed[m].format(d="d.f[i]", s="s.f[i]")
-            return [f"{{ Xmm s = {src_x(1)}, d = {x(0)}; for (int i = 0; i < 4; i++) d.f[i] = {e}; {x(0)} = d; }}"]
-        bitwise = {"andps": "d.u[i] & s.u[i]", "orps": "d.u[i] | s.u[i]", "xorps": "d.u[i] ^ s.u[i]",
-                   "andnps": "~d.u[i] & s.u[i]"}
-        if m in bitwise:
-            return [f"{{ Xmm s = {src_x(1)}, d = {x(0)}; for (int i = 0; i < 4; i++) d.u[i] = {bitwise[m]}; {x(0)} = d; }}"]
+            return [f"{{ __m128 s = XL({src_x(1)}), d = XL({x(0)}); XS({x(0)}, {packed[m]}); }}"]
         if m == "shufps":
             return [f"{x(0)} = sse_shufps({x(0)}, {src_x(1)}, {ops[2].imm & 0xFF});"]
         if m in ("unpcklps", "unpckhps"):
@@ -649,10 +649,10 @@ def main():
         for f in todo[i:i + FUNCS_PER_FILE]:
             if f["entry"] in hle:  # replaced by a host implementation in runtime/
                 name, va = hle[f["entry"]], f["entry"]
-                parts.append(f"void hle_{name}(X86Ctx *c);\nvoid f_{va:08X}(X86Ctx *c) {{ "
+                parts.append(f"RT_API void hle_{name}(X86Ctx *c);\nvoid f_{va:08X}(X86Ctx *c) {{ "
                              f"c->last_fn = 0x{va:08X}u; hle_{name}(c); }}\n\n")
                 if f["blocks"]:  # keep the original as o_XXXXXXXX so a host version can wrap or defer to it
-                    parts.append(lifter.lift_function(f).replace(f"void f_{va:08X}(", f"void o_{va:08X}(", 1)
+                    parts.append(lifter.lift_function(f).replace(f"void f_{va:08X}(", f"GAME_API void o_{va:08X}(", 1)
                                  + "\n\n")
             else:
                 parts.append(lifter.lift_function(f) + "\n\n")
@@ -660,9 +660,10 @@ def main():
         nfiles += 1
 
     write_if_changed(os.path.join(out_dir, "func_table.c"),
-                     '#include "funcs.h"\n\nconst FuncEntry g_func_table[] = {\n'
+                     '#include "funcs.h"\n\nGAME_API uint8_t *g_mem; /* the runtime\'s, set by game_load */\n\n'
+                     'GAME_API const FuncEntry g_func_table[] = {\n'
                      + "".join(f"    {{0x{f['entry']:08X}u, f_{f['entry']:08X}}},\n" for f in todo)
-                     + f"}};\nconst uint32_t g_func_count = {len(todo)};\n")
+                     + f"}};\nGAME_API const uint32_t g_func_count = {len(todo)};\n")
     if hle:
         print(f"{len(hle)} functions replaced by host implementations")
 

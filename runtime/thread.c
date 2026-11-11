@@ -25,8 +25,8 @@ enum { OBJ_EVENT_NOTIFY = 0, OBJ_EVENT_SYNC = 1, OBJ_MUTANT = 2, OBJ_SEMAPHORE =
 /* after a change to an object's signal state: the threads waiting on it alone sleep on that word (wait_objects) */
 static void wake(uint32_t o) { WakeByAddressAll(&OBJ_SIGNAL(o)); }
 
-static __declspec(thread) jmp_buf *t_exit;
-__declspec(thread) X86Ctx *t_ctx; /* this host thread's guest context, for crash reports */
+static THREAD_LOCAL jmp_buf *t_exit;
+THREAD_LOCAL X86Ctx *t_ctx; /* this host thread's guest context, for crash reports */
 
 /* The guest lock is a FIFO ticket lock, so a holder that yields at a SAFEPOINT really hands over instead of
  * winning the lock straight back. Waiters sleep on the "now serving" counter with WaitOnAddress. A holder
@@ -415,8 +415,8 @@ static int is_signaled(uint32_t o, uint32_t thread) {
 /* User APCs (I/O completion routines) wait on their thread's queue until it waits alertably, as on the Xbox:
  * run straight from the read, ReadFileEx callbacks found their caller's request half set up. Only a thread's own
  * I/O queues them (no NtQueueApcThread), so a thread-local queue checked as the wait starts is enough. */
-static __declspec(thread) struct { uint32_t routine, args[3]; } t_apcs[256];
-static __declspec(thread) int t_napcs;
+static THREAD_LOCAL struct { uint32_t routine, args[3]; } t_apcs[256];
+static THREAD_LOCAL int t_napcs;
 
 void queue_user_apc(X86Ctx *c, uint32_t routine, uint32_t a0, uint32_t a1, uint32_t a2) {
     if (t_napcs == 256) { /* never seen: a thread that issues this much I/O without waiting alertably */

@@ -2,9 +2,17 @@
 #pragma once
 #include "x86.h"
 
+/* a per-thread variable: clang's mingw target (the zig build) ignores __declspec(thread) and made them globals that
+ * every thread shared */
+#ifdef _MSC_VER
+#define THREAD_LOCAL __declspec(thread)
+#else
+#define THREAD_LOCAL __thread
+#endif
+
 /* Guest address map (all inside the 4 GiB g_mem reservation). */
 #define GUEST_RAM_BASE 0x00010000u   /* first 64 KiB left unmapped to catch NULL derefs */
-#define GUEST_RAM_END g_ram_end      /* 128 MiB like a devkit (retail has 64); 192 with VIDEOMODE 1080 (main.c) */
+#define GUEST_RAM_END g_ram_end      /* 128 MiB like a devkit (retail has 64); 192 with VIDEOMODE 720 or 1080 (main.c) */
 #define GUEST_HEAP_BASE 0x00800000u  /* bump heap for all game allocations, above the XBE image */
 #define PHYS_ALIAS 0x80000000u       /* all of RAM again, as on the Xbox: VA 0x80000000 + physical */
 #define WC_ALIAS 0xF0000000u         /* and again, the write-combined view D3D uses for texture memory */
@@ -41,7 +49,9 @@ uint32_t guest_block_size(uint32_t va); /* 0 if va is not a block */
 void guest_alloc_selftest(void);
 uint32_t kernel_alloc(uint32_t size);
 uint32_t guest_heap_top(void);
+void guest_heap_stats(uint32_t *live, uint32_t *top, uint32_t *free_bytes, uint32_t *largest);
 void kernel_init(void);
+void game_load(void); /* runtime.c: the lifted game code (forza_recomp.dll), once g_mem is reserved */
 void kernel_call(X86Ctx *c, uint32_t ordinal);
 const char *guest_path_root(void);
 
@@ -104,7 +114,16 @@ void forza_vblank(void);            /* hle_forza.c: each emulated vblank */
 uint32_t nv2a_display(void);        /* nv2a.c: the frame on screen (PCRTC start) */
 extern int g_vblank_hz;             /* hle_forza.c: the emulated vblank's rate (FRAME RATE above 60 raises it) */
 const char *forza_screen(void);     /* hle_forza.c: the class of the screen on top, "" before the first */
-int forza_menu_open(void);           /* hle_forza.c: a menu is on screen (the pause menu too), not just the race */
+int forza_menu_open(void);
+/* achieve.c: achievements, from what the game does */
+void achieve_init(void);
+void achieve_poll(void);                       /* the current profile's state, about twice a second */
+void achieve_screen(const char *cls);          /* the screen on top changed */
+void achieve_car(uint32_t car, int human);     /* a car's drivers are about to run */
+void achieve_file(const char *path, int writing); /* the game opens a file */
+void achieve_readback(uint32_t width, uint32_t height);
+int achieve_count(void), achieve_earned(void), achieve_has(int i), achieve_toast_next(void);
+const char *achieve_name(int i), *achieve_desc(int i);           /* hle_forza.c: a menu is on screen (the pause menu too), not just the race */
 int forza_race_view(void);          /* hle_forza.c: the race, its countdown or its replay is on top; any thread */
 int forza_racing(void);              /* hle_forza.c: the race (or its countdown) is the screen on top; any thread */
 void profile_run(int seconds); /* profile.c */
@@ -126,4 +145,4 @@ void render_present(uint32_t addr);
 void render_overlay(int enable, uint32_t addr, uint32_t w, uint32_t h, uint32_t pitch, uint32_t format, const int *dst,
                     int key_on, uint32_t key); /* key: ARGB colour key */
 int ktrace(void);
-extern __declspec(thread) X86Ctx *t_ctx;
+extern THREAD_LOCAL X86Ctx *t_ctx;

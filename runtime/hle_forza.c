@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include "xbox.h"
 
@@ -65,9 +66,10 @@ void forza_init(void) {
  * shortcut: not in a Drivatar lesson (no opponents): the AI's planning there reads a list the race never set up (null
  * [this+0x4C] in 0x2518D0, reached from the AI's step) and the game stops; lessons are driven by hand or W. */
 static uint32_t g_auto_car, g_auto_ai; /* the player's car and its AI during 0xB0A50 */
-void o_000B0A50(X86Ctx *c);
+extern GuestFn o_000B0A50;
 void hle_ForzaCarDrivers(X86Ctx *c) {
     uint32_t car = M32(c->esp + 4), human = M32(car + 0x40), ai = M32(car + 0x44);
+    achieve_car(car, human && M32(human) == 0x4902A4u);
     if (!g_autodrive || !human || M32(human) != 0x4902A4u || !ai) { /* CHumanDriver's vtable */
         o_000B0A50(c);
         return;
@@ -79,7 +81,7 @@ void hle_ForzaCarDrivers(X86Ctx *c) {
     g_auto_car = g_auto_ai = 0;
 }
 
-void o_000597E0(X86Ctx *c);
+extern GuestFn o_000597E0;
 void hle_ForzaHumanControls(X86Ctx *c) {
     uint32_t self = c->ecx, car = M32(self + 0x18), ai = car && car == g_auto_car ? g_auto_ai : 0;
     if (!ai) {
@@ -109,7 +111,7 @@ void hle_ForzaHumanControls(X86Ctx *c) {
  * surface; once D3D has waited for the GPU, a level 0 the game rendered to is copied back from its host target
  * (render.c), which is all that was ever drawn. Data (+4) is the surface's physical address. */
 void render_readback(uint32_t addr, uint32_t fmt, uint32_t size);
-void o_003BFCA0(X86Ctx *c);
+extern GuestFn o_003BFCA0;
 void hle_Lock2DSurface(X86Ctx *c) {
     uint32_t p = ARG(0), level = ARG(1);
     o_003BFCA0(c);
@@ -128,20 +130,20 @@ void forza_vblank(void) {
 }
 
 /* ---------------- Recomp Settings menu ----------------
- * A seventh main menu item, RECOMP SETTINGS, opens a screen built like Options (0x15A870: a title, then items added by
- * 0x199580(label, description, icon, screen factory, 0)) whose rows are this port's settings and two pages of keyboard
- * keys. A row's "factory" (called with ecx = the row's holder, which tells the rows apart) cycles its value in
+ * Main menu items after OPTIONS: ACHIEVEMENTS (page 4), RECOMP SETTINGS and QUIT GAME. RECOMP SETTINGS opens a
+ * screen built like Options (0x15A870: a title, then items added by 0x199580(label, description, icon, screen factory,
+ * 0)) whose rows are this port's settings and two pages of keyboard keys. A row's "factory" (called with ecx = the row's holder, which tells the rows apart) cycles its value in
  * recomp.ini, starts waiting for a new key, or opens a page; one that returns no screen is taken as a return to this
  * one. Menu text is a LocString {own text, -, string table 0x5BB308, u16 id} resolved by the table's Lookup (0x340C0)
  * whenever it is drawn, so ids from 0xF000 up are answered here, with the values as saved. */
-void o_000340C0(X86Ctx *c); /* lifted originals */
-void o_0035B040(X86Ctx *c);
-void o_00098230(X86Ctx *c);
+extern GuestFn o_000340C0; /* lifted originals */
+extern GuestFn o_0035B040;
+extern GuestFn o_00098230;
 
 #define STRINGS 0x5BB308u /* the UI string table */
 #define MY_ID 0xF000u     /* 0: entry and title, 1: its description, then label and description per row
                            * (the game's own string tables stop at id 10010) */
-#define SLOTS 128
+#define SLOTS 256
 
 typedef struct {
     const char *key, *label, *desc; /* descriptions get three lines of about 37 characters */
@@ -189,19 +191,21 @@ static int setting_index(int i) { /* of the saved value; the first if it is none
     return 0;
 }
 
-/* screens: 0 Recomp Settings, 1 driving keys, 2 menu keys, 3 quit; the rows of all of them in one list */
-enum { R_SETTING, R_PAGE, R_KEY, R_QUIT };
+/* screens: 0 Recomp Settings, 1 driving keys, 2 menu keys, 3 quit, 4 achievements; the rows of all of them in one list */
+enum { R_SETTING, R_PAGE, R_KEY, R_QUIT, R_ACH };
 typedef struct {
     int screen, kind, i, menu;
 } Row;
 static Row g_rows[(SLOTS - 2) / 2];
 static int g_nrows;
-static const char *const g_pages[4][2] = {
+static const char *const g_pages[5][2] = {
     {"", ""},
     {"DRIVING KEYS", "Keyboard keys for racing. The arrow keys also steer, accelerate and brake."},
     {"MENU KEYS", "Keyboard keys for the menus and the pause menu."},
-    {"QUIT GAME", "Close the game and return to Windows."}};
+    {"QUIT GAME", "Close the game and return to Windows."},
+    {"ACHIEVEMENTS", "What this profile has earned, and how to earn the rest."}};
 #define QUIT_ROW (NSETTINGS + 2) /* the main menu's QUIT GAME and its screen's title, listed on no screen (-1) */
+#define ACH_ROW (NSETTINGS + 4)  /* the main menu's ACHIEVEMENTS, likewise */
 
 static void build_rows(void) {
     if (g_nrows) return;
@@ -210,6 +214,8 @@ static void build_rows(void) {
     g_rows[g_nrows++] = (Row){0, R_PAGE, 2, 0};
     g_rows[g_nrows++] = (Row){-1, R_PAGE, 3, 0};
     g_rows[g_nrows++] = (Row){3, R_QUIT, 0, 0};
+    g_rows[g_nrows++] = (Row){-1, R_PAGE, 4, 0};
+    for (int i = 0; i < achieve_count(); i++) g_rows[g_nrows++] = (Row){4, R_ACH, i, 0};
     for (int menu = 0; menu < 2; menu++)
         for (int k = 0; k < input_nbindings(menu); k++) g_rows[g_nrows++] = (Row){1 + menu, R_KEY, k, menu};
 }
@@ -224,7 +230,16 @@ static void my_text(uint32_t k, char *t, size_t n) {
         const Setting *s = &g_settings[g_rows[r].i];
         if (k % 2 == 0) snprintf(t, n, "%s: %s", s->label, s->names[setting_index(g_rows[r].i)]);
         else snprintf(t, n, "%s", s->desc);
-    } else if (g_rows[r].kind == R_PAGE) snprintf(t, n, "%s", g_pages[g_rows[r].i][k % 2]);
+    } else if (g_rows[r].kind == R_PAGE && g_rows[r].i == 4 && k % 2 == 0)
+        snprintf(t, n, "ACHIEVEMENTS: %d OF %d", achieve_earned(), achieve_count());
+    else if (g_rows[r].kind == R_PAGE) snprintf(t, n, "%s", g_pages[g_rows[r].i][k % 2]);
+    else if (g_rows[r].kind == R_ACH) {
+        if (k % 2) snprintf(t, n, "%s%s", achieve_has(g_rows[r].i) ? "Earned. " : "", achieve_desc(g_rows[r].i));
+        else {
+            snprintf(t, n, "%s", achieve_name(g_rows[r].i));
+            for (char *q = t; *q; q++) *q = (char)toupper((unsigned char)*q);
+        }
+    }
     else if (g_rows[r].kind == R_QUIT) snprintf(t, n, k % 2 ? "Closes the game. Back returns to the main menu." : "YES, QUIT");
     else if (k % 2 == 0) input_binding_text(g_rows[r].menu, g_rows[r].i, t, n);
     else snprintf(t, n, "Select, then press the new key.");
@@ -286,7 +301,7 @@ static void row_chosen(X86Ctx *c) { /* a row's factory (cdecl, no arguments; ecx
         if (st->apply) st->apply(v);
     } else if (r >= 0 && g_rows[r].kind == R_KEY) input_capture(g_rows[r].menu, g_rows[r].i);
     else if (r >= 0 && g_rows[r].kind == R_QUIT) ExitProcess(0); /* as closing the window does */
-    else if (r >= 0) s = make_screen(c, g_rows[r].i);
+    else if (r >= 0 && g_rows[r].kind == R_PAGE) s = make_screen(c, g_rows[r].i); /* an achievement: nothing */
     c->eax = s;
     c->esp += 4;
 }
@@ -307,7 +322,9 @@ static uint32_t make_screen(X86Ctx *c, int screen) {
     M8(s + 0x2158) = 0;
     for (int r = 0; r < g_nrows; r++)
         if (g_rows[r].screen == screen) {
-            uint32_t h = add_item(c, s, MY_ID + 2 + 2 * r, 5 /* the HUD/UI icon */, row_chosen);
+            /* the HUD/UI icon (5); an achievement not yet earned an empty one (0: the set has no tick) */
+            uint32_t icon = g_rows[r].kind == R_ACH && !achieve_has(g_rows[r].i) ? 0 : 5;
+            uint32_t h = add_item(c, s, MY_ID + 2 + 2 * r, icon, row_chosen);
             g_holders[g_nholders % 256].holder = h, g_holders[g_nholders % 256].row = r, g_nholders++;
         }
     return s;
@@ -323,11 +340,17 @@ static void quit_screen(X86Ctx *c) {
     c->esp += 4;
 }
 
+static void achievements_screen(X86Ctx *c) {
+    c->eax = make_screen(c, 4);
+    c->esp += 4;
+}
+
 void hle_ForzaMainMenu(X86Ctx *c) { /* MainMenu::MainMenu(arg) (thiscall), then our items after OPTIONS */
     o_0035B040(c);
     uint32_t screen = c->eax;
     build_rows();
-    add_item(c, screen, MY_ID, 8 /* the OPTIONS icon of ico_Main.xpr */, settings_screen);
+    add_item(c, screen, MY_ID + 2 + 2 * ACH_ROW, 8 /* the OPTIONS icon of ico_Main.xpr */, achievements_screen);
+    add_item(c, screen, MY_ID, 8, settings_screen);
     add_item(c, screen, MY_ID + 2 + 2 * QUIT_ROW, 8, quit_screen);
     c->eax = screen;
 }
@@ -371,11 +394,16 @@ int forza_menu_open(void) {
     static int log = -1;
     if (log < 0) log = getenv("UILOG") != NULL;
     uint32_t top = g_ui ? M32(g_ui + 4) : 0, vt = top ? M32(top) : 0;
+    achieve_poll();
     if (top != last) {
         class_name(vt, g_screen, sizeof g_screen);
-        if (log)
-            fprintf(stderr, "[ui] top screen %08X %s (vtable %08X) at %llu ms\n", top, g_screen, vt,
-                    (unsigned long long)GetTickCount64());
+        achieve_screen(g_screen);
+        if (log) {
+            uint32_t live, htop, hfree, largest;
+            guest_heap_stats(&live, &htop, &hfree, &largest);
+            fprintf(stderr, "[ui] top screen %08X %s (vtable %08X) at %llu ms; heap live %X top %X free %X largest %X\n",
+                    top, g_screen, vt, (unsigned long long)GetTickCount64(), live, htop, hfree, largest);
+        }
     }
     last = top;
     return vt != 0x4958E4 && vt != 0x4BCC04;

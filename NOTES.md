@@ -6,7 +6,7 @@
 - `tools/find_functions.py` — function discovery; `tools/why_missing.py` explains a missed address
 - `tools/lift.py` — x86 -> C lifter; `tools/insn_stats.py` — instruction histogram
 - `tools/gen_kernel_exports.py` — builds `runtime/kernel_exports.h` from nxdk's CC0 `third_party/nxdk/xboxkrnl.exe.def`
-- `tools/oovpa_pp.bat` + `tools/find_symbols.py` — names XDK library functions using XbSymbolDatabase signatures
+- `tools/oovpa_pp.py` + `tools/find_symbols.py` — names XDK library functions using XbSymbolDatabase signatures
   (`third_party/XbSymbolDatabase`, MIT code / ODbL data; only its tables are preprocessed, nothing of it runs)
 - `tools/build.py` — incremental build (only stale objects recompile; the linker is incremental)
 - `tools/texextract.py` — every texture on the disc into the texture dump; `tools/texpack.py` — 4x texture pack
@@ -46,10 +46,10 @@ Pipeline:
 ```
 python tools/xiso_extract.py <iso> game
 python tools/find_functions.py game/Forza.xbe analysis/Forza.functions.json
-tools\oovpa_pp.bat
+python tools/oovpa_pp.py
 python tools/find_symbols.py game/Forza.xbe build/oovpa third_party/nxdk/xboxkrnl.exe.def analysis/Forza.symbols.json
 python tools/lift.py game/Forza.xbe analysis/Forza.functions.json recomp --hle runtime/hle.txt --symbols analysis/Forza.symbols.json
-python tools/build.py      (first build ~2 min, then incremental)
+python tools/build.py      (Visual Studio, first build ~2 min, then incremental; --zig: the players' build, ~1.5 min)
 build\forza.exe game       (KTRACE=1 traces every kernel call; KWATCH=<hex addr> reports writes to a dword)
 ```
 
@@ -198,6 +198,39 @@ showroom, assists, Recomp Settings, pause/quit, videos, sound, saves.
   Scoreboards do nothing when chosen (no network, one pad, no Live); Xbox Live > New Account asks to quit to the
   dashboard, and Yes calls HalReturnToFirmware, which now says in a box that there is no dashboard before closing
   (it closed silently).
+- **Achievements** (requested for 0.2, 2026-11-06): runtime/achieve.c, 32 of them (docs/achievements.md), a pop-up
+  (render.c achieve_toast: GDI into a texture, the emblem from the exe's icon, sliding down from the top for 4 s) and
+  ACHIEVEMENTS: n OF 32 on the main menu (hle_forza.c: page 4; first in Recomp Settings, moved 2026-11-08 as the
+  owner asked; an empty icon (0) for one not earned, the gauge (5) for one
+  earned; SLOTS 256 for the menu's strings). Kept in hdd\achievements\<profile name>.txt (beside the game's hdd,
+  <game>\..\hdd: until 2026-11-10 the path was relative, and the launcher starts the game in build\, so nothing was
+  ever saved and each start re-earned the progress ones with pop-ups, as the owner reported), under TESTKEYS in
+  build\achievements_test\ (test races auto-select the first profile, the player's). What they read, found by RAM
+  dumps (build/ram.now) and car dumps against the screen:
+  - the profile: [0x5902C4] -> CPlayerProfile (vtable 0x49235C): +0x250 name (UTF-16), +0x358 cars, +0x35C its
+    CGarageImpl, +0x3D4 credits, +0x3D8 winnings, +0x3DC level, +0x3F0 time played (s, float), +0x3F4 distance (m);
+  - a car (the 0xB0A50 hook; a player's has CHumanDriver 0x4902A4 at +0x40): +0xBC place (from 1, set once racing),
+    +0x40C position, +0x458 velocity (m/s; its length matched the speedometer within 1% over 13 dumps);
+  - a Drivatar's DrivatarProfile.xml (named as its profile at 0): +0x75 a bit per lesson passed (0x1F: all five);
+  - screens: CRaceResultsWindow (a race over), CSavingReplayPopup, CUICarGift / CUICarUnlockPopup, Apply Decals'
+    LayerColorScreen (a vinyl placed), UpgradeInstallInfoOverlay / CUIConfirmPurchase (then credits down, no car:
+    an upgrade); the screen after the main menu tells the mode (Arcade, Career, Multiplayer, Free Run; Time Trials
+    is CUIEventSelectWindow); a race alone on the track is a Time Trial;
+  - files: a track's .xb2 (which location), a *.cht written (a tuning setup), a 1024x1024 read back (render.c: a
+    paint job saved).
+  Checked in the game: Lights Out, Chequered Flag and Couch Rivals (a split-screen win), Against the Clock, Ton Up,
+  Director's Cut, Student Teacher and Graduation Day (the player's Drivatar has all five), Setup Sheet, Vinyl Artist,
+  Fresh Coat, Wrench Turner; the place, track and mode in the log line "[achieve] race over". The player's saves
+  were backed up before and restored after (the tests bought a part, saved a setup and a paint job).
+- **Split screen** (requested for 0.2, 2026-11-05): works with a second controller (host pad 2 = port 1). Checked
+  with TESTPAD2=1 (hle_xinput.c: port 1 reported, held by test keys + 4096: Enter/Space A, Esc B, arrows, Tab
+  Start, W/S triggers, A/D steer): Multiplayer > Split Screen shows Player 1 Start / Join, port 1's A joins, Create
+  Match (Circuit Race, Maple Valley Short, 3 laps), each player's class, car and assists
+  (CUIFreeRunCarClassSelect, SelectCarView, CUIAssistsMenu), then a two-view race, each with its HUD; at 32:9 each
+  view is a 64:9 strip in proportion (the split camera's 0x495CE0 is widened too) and the HUDs go to the edges.
+  The keyboard is merged into port 0, so one pad and the keyboard are one player. INPUTLOG also logs XInputOpen.
+  Menus repeat a held direction by frames: one press of 150 ms moves one item at 60 and 144, 300 ms two at 60 and
+  three at 144 (build: test taps of 40-60 ms).
   Also reached without a crash: Time Trials to a race; Career from a new profile (home region, buying the Lexus
   IS300, the career menu, the level tip) to a North American Open race; the European and Asian Opens refuse the
   car, as they should.
@@ -396,6 +429,197 @@ showroom, assists, Recomp Settings, pause/quit, videos, sound, saves.
   The port's own code is MIT (LICENSE, "the Redline Recompiled contributors"; third_party/ keeps its licences).
 Not for 0.1: Xbox Live (never), System Link, DES.
 
+### To do for 0.2 (requested 2026-11-08; not started)
+- **Achievement pop-up like the Xbox 360's**, in Redline Recompiled's style: the 360 toast's shape and motion (a
+  rounded bar sliding in, the icon in a circle on the left, "Achievement unlocked" over the name), our colours and
+  emblem, and an unlock sound of our own (made for the port, not the 360's). Today: render.c achieve_toast.
+- **Players get errors building the game** (reported by many). Collect their launcher logs and fix the causes;
+  the next item would remove most of them.
+- **Simpler requirements, like other recomps:** no Visual Studio build tools or Python to play; those only for
+  making the texture pack. Decided (owner, 2026-11-08): **nothing of the game ever ships** (no prebuilt exe with
+  the translated code: the owners could take the project down), so the player's PC still translates and compiles
+  it, with tools that come with the download instead of installs. Direction: ship our own runtime prebuilt (an exe
+  with no game code) and build only the game code, into a DLL it loads (plain C, no C runtime, calling the exe's
+  exports), with a portable compiler and linker (e.g. clang + lld, or zig cc; fetched pinned and checksummed like
+  tools/fetch_sdks.py, or bundled) and the Python tools frozen into an exe (lift, analysis; capstone inside).
+  **Chosen 2026-11-10** (the owner: no release until a fresh PC builds and plays with nothing installed by hand):
+  1. **Done (3a786a7):** build/redline.exe is the runtime only (1.75 MB, no game code; /MT, so no VC++
+     redistributable); the lifted code is build/forza_recomp.dll (x86.h RT_API / GAME_API). The DLL imports the
+     runtime's 13 helpers, g_gil_waiters and the 97 hle_ functions (build/redline.def from hle.txt; redline.lib, 30 KB,
+     its import library) and exports g_func_table, g_func_count, its own g_mem (set once by runtime.c game_load) and
+     the o_ originals the hle code calls (9, resolved by name). Checked in a race.
+  2. **The player's build needs only:** capstone (find_functions, lift; Pillow and numpy are for the texture and
+     video tools, not the build), a C preprocessor (oovpa_pp.bat: cl /EP) and a compiler and linker for the DLL.
+     Plan: Python 3.12.10's embeddable zip with capstone 5.0.7's wheel unpacked beside it (the versions here, so the
+     lifted code is the same), and zig 0.14.1 (clang 19, lld, mingw-w64 headers, the OS's UCRT: no VC++ runtime) for
+     `zig cc -E` and the DLL, which links redline.lib. Downloads waiting for the owner's OK (2026-11-10): zig
+     82.2 MB (ziglang.org), Python 11.1 MB (python.org), capstone 1.3 MB (PyPI). To measure first: clang's time and
+     memory on recomp/ (MSVC: 3.1 GB at 16 files at once, ~2 min here); MSVC-only things in the lifted code.
+  3. **Corrected by the owner (2026-11-10): only the launcher (and the source) is uploaded, never a built exe, not
+     even the runtime without game code.** So the player's PC builds the runtime too, and the launcher fetches the
+     tools at build time (pinned and checksummed from their official sources, as fetch_sdks.py does), not the zip.
+     The exe / DLL split (step 1) is no longer needed for that; it stays unless it gets in the way (the runtime and
+     the game code build and fail separately).
+  4. **Done (a1ee1ef, 1a3ecea), 2026-11-10: the whole build runs with nothing installed.** zig compiles all of it:
+     recomp/ in 53 s here (8 at a time; funcs_030.c 24 s and 1.4 GB, funcs_039.c 0.8 GB), the runtime in 3 s, all
+     25 runtime files unchanged but for: THREAD_LOCAL (xbox.h; clang's mingw target ignores __declspec(thread), which
+     made t_ctx and the other per-thread variables shared: a crash in gil_yield) and runtime/msvc_shim.c, the 12 MSVC
+     runtime pieces NGX uses (operator new / delete and two STL errors under their MSVC names, the /GS cookie and its
+     unwind handlers, thread-safe statics, _fltused), with empty stand-ins for the libraries NGX's .drectve asks for
+     (LIBCMT, libcpmt, OLDNAMES, uuid). DLSS works (a race with "[dlss] ready"). The exe needs only Windows' DLLs,
+     the Universal CRT and SDL3; onecore and synchronization by the API sets (api-ms-win-core-memory-l1-1-6,
+     -synch-l1-2-0); zig rc builds the icon; zig dlltool makes redline.lib from redline.def. build.py --zig builds both
+     in ~1.5 min (with PDBs: crash reports name the guest instruction). oovpa_pp.py (zig's preprocessor, else cl /EP)
+     gives find_symbols.py the same 395 symbols; lift.py with the fetched Python writes byte-identical recomp/.
+     The launcher fetches Python 3.12.10 (embeddable, writing its ._pth: its own folder for capstone, ../../../tools),
+     capstone 5.0.7 and zig 0.14.1 into build\tools (pinned SHA-256; URLDownloadToFile, Windows' own tar.exe), and
+     stops if the port's folder path is over 120 characters (zig's deepest file is 114 below build\tools\zig-0.14.1).
+     Checked from the release zip in an empty folder: the launcher fetched the tools and built in 2 min (zig's cache
+     warm), and the game reached the main menu.
+  5. **Fresh-PC test: PASS (2026-11-10).** Windows Sandbox (no Python, no Visual Studio, nothing installed), the
+     release folder plus a driver script (the launcher's file dialog given C:\Map\Forza.iso, Build, then Play): the
+     launcher fetched its tools, built in 7 min (zig's cache cold, 2 compiles at a time in the sandbox's memory), and
+     the game ran, still showing its attract movies 33 min later; no error windows, no crash, Defender clean.
+     Left: Cancel cannot stop a download in progress (URLDownloadToFile blocks); fetch_sdks.py under the fetched
+     Python not yet run (the DLSS and FSR files were copied in for the tests, to download nothing but the three
+     approved tools). Visual Studio stays the development build (python tools/build.py).
+- **A how-to for making the texture pack** (tools/texextract.py, tools/texpack.py, Real-ESRGAN; and the videos).
+- From GitHub (DivxPlays/redline-recompiled, read 2026-11-08 and 2026-11-10; issues #1-3, #5-18, PR #4, none
+  answered yet):
+  - **C1002, compiler out of heap in pass 2** (#2, #3, #8, #16; Visual Studio 2026 and Build Tools 2022, 16 GB RAM,
+    16 CPUs): recomp/funcs_039.c's f_002E5DC0, f_002E6930, f_002E74E0, f_002E8050 (~4,000 lines each), then D8040.
+    **Fixed 2026-11-10** (not released): measured alone, funcs_039.c took 65.4 GB of commit to compile (it built here
+    only because this PC has 61.5 GB and a page file), so fewer parallel cl would not have helped. Those four are
+    long SSE blocks (~1,200 addps/subps/mulps each, an FFT called from 0x2DB922/0x2DBC18), and lift.py wrote every
+    packed op as a loop over 4 lanes. It now writes one host SSE intrinsic each (x86.h XL/XS; same lane math,
+    rsqrtps/rcpps still exact): funcs_039.c 0.24 GB in 8 s (was 40 s), funcs_030.c 0.44 GB (was 1.71), all 59 files
+    16 at a time 3.1 GB peak (was 48.7 GB 8 at a time). PR #4 (opt off for the 67 functions of 3,000+ lines) is not
+    needed and would have slowed those; thank them and close it when 0.2 goes out. The race's sound after the
+    change (20 s recorded) sounded right to the owner (2026-11-10).
+  - **#1: "does not build"** after ~2 hours, extra installs, "several different image files": the launcher takes
+    only Forza Motorsport (USA) (Rev 1) (SHA-1 check). Say plainly which disc is needed, and why another fails.
+  - **Hitches** (#3, build\redline.log, RX 6600): 5,027 ms at CPreEventOverlay (96 shaders compiled, 353 textures
+    decoded in one frame: first run, nothing cached), 2,329 ms SelectCarView, 3,000 / 2,017 / 1,884 / 1,233 ms unnamed,
+    1,200 ms CUIPlayerProfile, 1,083 ms CUIOptionsMenu twice with no shaders or textures (CPU-side), 635 ms
+    CUIScoreboardUpdating; menus 60-170 ms typically. Shaders could be compiled ahead (at build time, or warmed from
+    a list) so a first race does not stall.
+  - **Controls vs the game's diagram** (#3): Controller Options with "Shift on A/B Buttons" shows X e-brake, A gear
+    up, B gear down; the port's table (hle_xinput.c g_bind) has A e-brake, B up, X down, and the keyboard's E/Q send
+    B/X. Check in the game which pad buttons shift under each Controller Options layout; match it or document it.
+  - **Pad buttons cannot be rebound** (#3): Recomp Settings rebinds keyboard keys only; asked for rebinding driving
+    actions on a pad, or shifting on the shoulders (Black/White).
+  - **Kernel settings 0x11 and 0xA read as 0** at startup (kernel.c "[k] setting ... reads as 0"): check what the
+    game reads them for.
+  - **#5 "Game won't install"** (PsxMicha, Windows 11, opened 2026-11-08): find_functions.py stops with
+    FileNotFoundError on analysis\Forza.functions.json, i.e. the analysis folder is not there. **#9** is the same.
+    **Fixed 2026-11-10** (not released): choosing the ISO with the launcher's file dialog made the ISO's folder the
+    launcher's current one, so CreateDirectoryA("analysis") made it there while the steps run in the root. The dialog
+    now has OFN_NOCHANGEDIR, and find_functions.py makes its output folder.
+  - **Crash loading a race at 720p: "guest heap exhausted"** (#17, RX 9060 XT; after one or several races, always on
+    a race selection screen): "want 1000 at 08000000; 757 free ranges, 2ACA3D0 bytes" (43 MB free, 111 MB live:
+    00266BE5 55 MB, 002FB568 34 MB, 0026BC1E 15 MB). The player found 1080i does not crash: only 1080 gets 192 MiB
+    of guest RAM (main.c g_ram_end). **Fixed 2026-11-10** (not released). The 1,011 4 KiB blocks by 00267332 are
+    XAPI's VirtualAlloc (NtAllocateVirtualMemory, through [0x4863F0]), which kernel.c aligned to 64 KiB, so each one
+    left a 60 KiB gap; UILOG's screen lines now print the heap (live, top, free, largest free range), and at 720p
+    the free space below the top was ~33 MB in pieces of at most F000 by the first race. The failing "want 1000"
+    was one of those VirtualAllocs with no 64 KiB boundary left in any piece. The fix: 720p gets 192 MiB like 1080
+    (the player's 1080i workaround), and the "exhausted" line now gives the alignment and the largest free range.
+    Measured at 720p / 128 MiB, the North American Open: the live heap grows ~330 KB a race and the top ~320 KB
+    (results screen 4CC80E0 -> 4D1A1F0 over races 1-3): maybe a slow leak, or caches filling; watch longer runs.
+    **Lead for a real fix of the fragmentation** (480p keeps 128 MiB): VirtualAlloc page-aligned instead of 64 KiB
+    put a 720p race load's heap top at 74.8 MB instead of 99 MB (free pieces 0.5 MB instead of 26 MB), but crashed
+    while loading the first race: a garbage pointer (34F0DB50) pushed on the free list of the small-block allocator
+    at 0027D540 (4 KiB pages, link at +FFC). Something relies on the 64 KiB alignment (or on blocks not being
+    reused so soon); find it before changing the alignment. Squeezing 720p to 118 MiB failed sooner, on a 2 MB block
+    (align 1000) with 35 MB free in pieces of at most 1.2 MB, so the shredding hurts more than VirtualAlloc.
+  - **#16** is C1002 again; it asks whether the toolchain is 32- or 64-bit (build.py uses vcvars64, the 64-bit one).
+    **#8**'s screenshot is C1002 too (in Portuguese); it asks why 16 GB of RAM to build a 2005 game: see above.
+  - **#18 "cl not found on the MSVC PATH"** (screenshot): with cl.exe added to PATH by hand it said include files
+    were missing, so vcvars64 was not applied. build.py kept vcvars64's environment in build\vcvars.json forever,
+    even after Visual Studio was installed, updated or repaired. **Fixed 2026-11-10** (not released): the cache is
+    used only while vcvars64.bat is the same and its PATH has cl.exe, and when vcvars64 does not set up cl the build
+    stops with what vcvars64 printed (it was sent to nul). If #18 still fails, that text says why.
+  - **#15 "UNPLAYABLE"**: the install always stops ("worst launcher for recomps"), asks for a simpler install. The
+    fixes above and the simpler-requirements item answer it.
+  - **"RAM usage"** (#8, #15, the owner 2026-11-10): the build's, fixed above (the compile peaks at 3.1 GB with
+    16 files at once, zig compiles as many as free memory allows at ~1.5 GB each). The game's, measured 2026-11-10
+    at 480p / scale 2 / FSR 1 in an Arcade race at Alpine Ring with the camera views cycled: working set 0.3-0.44 GB
+    throughout; private (commit) 0.82 GB at most without the texture pack, with the 4x pack 1.6 GB at the grid
+    rising to 2.29 GB by 100 s as new textures come into view, then flat for the last minute (no leak); GPU
+    dedicated 1.75 GB (2.09 GB at 1080i / DLSS / ultrawide). The commit is mostly Windows backing the video memory;
+    texpack.c frees each decoded texture after its upload and holds the GPU at a third of its memory (LRU). Nothing
+    to cut there now.
+  - **Launcher Settings: ‹ steps forward** (#6, found in Stilwater): draw_settings registers the arrow's hit box
+    before the value box that covers it, and hit_test takes the last; register the arrow after the value box.
+    **Fixed 2026-11-10** (not released), checked by clicking it in a scratch copy (2x -> 1x; 0.1.0's went to 3x).
+  - **Launcher features every kit launcher has** (#10-14): say it's made with the help of AI (#10), the update
+    checker (#11), "What's new" once after an update (#12), works with a controller alone (#13), a "Report this
+    crash" button (#14).
+  - **Mouse steering / camera** (#7, from Stilwater): if added, drive the game's own steering or camera update from
+    the mouse's movement, not the stick (a stick's dead zone and acceleration make it feel like one).
+- From Reddit (r/decomps 1xp5sxc, 33K views, 26 comments; r/recomps 1xp61gv; read from the owner's PDFs
+  2026-11-08, a few comments cut at page breaks):
+  - **The build tools** (moesengott_, Turbulent-Pomelo8480, MaleficentBasket): "The Visual Studio C++ build tools
+    were not found..." read as "the launcher fails to download some build tools; never had this with any other
+    recomp"; "need to do as other recomps, that don't ask for Visual Studio desktop development C++, almost 7 GB
+    download, Python etc." The simpler-requirements item above; until then the launcher's message should say it
+    downloads nothing itself and what to install.
+  - **Asked for a built copy** ("mine gave errors, can you upload it and send it to me"): never (nothing of the game
+    ships); the C1002 fix and the simpler build are the answer.
+  - **Import saves from xRevive** (Ill_Excitement_8052, in Portuguese: wants their xRevive save, "a bit different"):
+    xRevive is another, closed-source PC version of Forza Motorsport; its save format would have to be studied
+    (a player's own save files only).
+  - **Micro-stutter in races**: the owner replied he'd fix it in the next update; with the hitches above.
+  - Not to act on: wishes (more threads, a graphics overhaul, more tracks, DLSS 5, path tracing, "do FM8 next"),
+    comparisons with xRevive and Relive, AI criticism.
+- **Linux / Steam Deck support** (requested 2026-11-08). First step: run the Windows build under Proton/Wine (the
+  Deck's way): D3D11 through DXVK, FSR 3's D3D12 through vkd3d, SDL3 input as is; DLSS is NVIDIA-only (not on the
+  Deck). The build on the player's PC is the hard part there (MSVC under Wine): the simpler-requirements work
+  (a portable compiler) would fix it for Linux too. Then the Deck itself: 1280x800 (16:10), its controls, and
+  defaults for its APU (render scale 1, FSR 1, 60 fps). A native Linux build (no Wine: Vulkan or GL instead of
+  D3D11, SDL audio instead of WASAPI, the Win32 calls in the runtime) would be a much bigger step.
+- **Mod support** (requested 2026-11-08; possible, in steps). 1) File mods: file.c already maps D:\ to the game
+  folder, so a mods\<name>\ folder whose files take the place of the disc's (cars, tracks, menus, strings, sounds)
+  is a small change, with an order between mods and a Recomp Settings page to switch them on. The texture pack and
+  upscaled videos already replace assets this way. 2) Code mods: hle.txt replaces guest functions with host code at
+  build time; a mod DLL that registers its own replacements or hooks at load (as Zelda64Recomp's mods do) needs a
+  small API and a stable list of hookable functions. Mods are made and shared by players (their own files; nothing
+  of the game ships with ours).
+- **HDR** (requested 2026-11-08). The game draws in 8-bit SDR, so HDR means expanding its picture: an HDR10 swap
+  chain (R10G10B10A2, ST.2084) or scRGB (FP16) when Windows reports an HDR display (IDXGIOutput6), the final
+  shrink/upscale pass mapping SDR to HDR (paper white for the HUD and menus, a peak brightness, highlights such as
+  the sun, lights and bloom lifted), and the scene's own targets kept at more than 8 bits where that helps.
+  Settings: HDR on/off, peak brightness, paper white. DLSS / FSR 3 told their input's range. Check: a picture
+  that matches SDR at paper white, nothing clipped or washed out, screenshots tone-mapped back to SDR.
+- **Camera views** (players report the other views don't work, 2026-11-08). **Reproduced and fixed 2026-11-10**
+  (not released): a race has four views (V / Black): two chase views were fine, and the bumper and hood views
+  showed only the HUD and the rear-view mirror on black, at 16:9 and 4:3 alike (not the widescreen code, not the
+  w-buffer). Their frame draws the mirror's scene, clears depth to far over the whole target, then to 0 in the
+  mirror's rect only (so the main scene leaves the mirror alone), then the main scene; render_clear cleared depth
+  with ClearDepthStencilView, which ignores the rect, so all of the target was 0 and every draw failed. A partial
+  depth/stencil clear of part of the *surface* is now drawn through a scissor (render.c depth_rect_clear); a clear of
+  the whole surface still clears the whole buffer. The first version compared the rect with the depth *target*,
+  which the 2x-AA scene makes twice a 640-wide pass's width: the first-person frames' light pass (a 640x480 grey
+  picture every scene draw samples on screen, cleared to 3F3F3F) then cleared half its depth, its triangles failed on
+  the other half, and the road's right half came out darker with a seam at the exact centre. Checked: all four views
+  in a race at 16:9 / 4:3 / the owner's settings (ultrawide, 1080i, DLSS), no seam, the showroom and menus the same
+  as before (pixel for pixel at 1080i). Not checked: replays, 32:9 exactly.
+  Seen on the way: with ultrawide the menus fill only the middle 16:9 (next item).
+- **Menus that fill 16:9, 21:9 and 32:9 screens** (requested 2026-11-10, "for the future"). Today, by design
+  (render.c ui_squeeze): with ULTRAWIDE the game's 2D (menus, dialogs, loading screens) goes into the middle 16:9 of
+  the picture, as wide as it was meant, and only full-width fills (the menus' green rules, fades) and post-processing
+  span the screen; on the owner's 32:9 monitor that leaves the menus half the width with black sides (480p and 1080i
+  the same; checked 2026-11-10 in the car class, showroom and assists screens). 16:9 screens are already filled.
+  Stretching the menus' 640 columns across would distort them (2x at 32:9). Ways, best looking first:
+  1) keep each menu's content 16:9 and fill the sides: its backdrop (the white-grey panels, the showroom's grey,
+     the menu movies) stretched or extended to the edges, or a blurred, darkened copy of the screen behind them;
+  2) move what sits at a menu's edges to the screen's edges, as the race HUD does (hud_side): the title and "My
+     Profile" at the top, the button prompts at the bottom;
+  3) a Recomp Setting for menus: 16:9 (now) / filled.
+  Check every screen kind (main menu, lists, showroom, garage, dialogs over a race, loading screens, Bink movies)
+  at 21:9 (ULTRAWIDE=233) and 32:9 (356), and that 16:9 does not change.
+- **Nothing of 0.2 goes to GitHub until the owner says it is ready to release.**
+
 ### Next steps
 0. **Draws work** (branch feat/nv2a-draws): pgraph.c (Kelvin state, vertex assembly), shaders.c (vertex programs
    and combiners -> HLSL), texture.c (swizzled/linear/DXT), render.c (D3D11, render-to-texture, AA resolve).
@@ -484,7 +708,8 @@ Not for 0.1: Xbox Live (never), System Link, DES.
    - IdexChannelObject's IRP queue (+0x28) is an empty list: XAPI's CancelIo walks it when the menu music stops.
    - Discovery seeds the CRT's x87 transcendental table (fmod/exp/sinh/cosh/tanh handlers at +0x10 of unaligned
      32-byte entries); the race hit a missing tanh handler 13 s in.
-   Debugging: `build/dump.now` dumps the next frame, `build/hang.now` prints every thread and carries on;
+   Debugging: `build/dump.now` dumps the next frame, `build/rt.now` saves it and every colour target as SCREENSHOT
+   does (build/frame.bmp, build/rt_*.bmp), `build/hang.now` prints every thread and carries on;
    `lift.py --trace runtime/trace.txt` logs calls (capped per function); `MEMWATCH=<addr>` finds writers.
    **Races run at full speed** (2026-11-02): the race clock now keeps wall time (20.0 s per 20.1 s; it was 1.5 s per
    6 s). Creating `build/prof.now` samples every host thread for 5 s (runtime/profile.c) and prints self and
@@ -897,6 +1122,22 @@ Not for 0.1: Xbox Live (never), System Link, DES.
    - 120 and 144 run the emulated vblank at that rate (thread.c). Menus then draw 140-144 new frames a second; a race
      with 7 AI cars 67-94 since vertex assembly got faster (it was ~60-80 alone: the emulated GPU works under the
      guest lock).
+   - Track flythroughs (reported 2026-11-05: "on 144 Hz the cutscenes in game go really fast", the event list's
+     track preview): a Bink video, D:\MEDIA\tracks\<track>\Flythrough.bik (29.97 fps), opened with flags 1, which
+     sets its rate to the game's own (refresh / vblanks per frame: 30 on the Xbox, 72 at 144 here) for a frame per
+     game frame. Copied ~70 frames a second at 144 (VIDEOLOG). hle_bink.c BinkWrapperOpen now gives such a video its
+     file's rate (BIK header +28/+32 into the handle's +0x14/+0x18, which BinkWait paces by) above 30: 28.8 a second
+     over 10 s. The step mode (0x5188FC) stayed 0 from the title through a race (logged), so nothing else steps by a
+     fixed 1/30 or 1/60 there. 0.2.0 (runtime/version.h) is the version being worked on.
+   - Shadows further out (requested 2026-11-05: scenery shadows on the road and other cars' shadows vanish in the
+     distance, most on city tracks). Ruled out so far: GeneralRender\Shadow's FadeOutRange / FadeOutAngle
+     (0x555744 / 0x555740: a fade by sun angle, cos 80-85 degrees, 0x1E05F0); its Focus/NonFocus Hi/Lo LOD
+     (0x555758-64: which car LOD casts, hi within 18 m (0x55574C), cars behind -10 m (0x555748) skipped, no far
+     limit, 0x1E12B8); GeneralRender\Misc DistanceBias (0x554EEC, 1.0, copied to the view's 0x5DA984: the object
+     test 0x1E33F3 culls at distance x bias > range when 0x5DA981 is set): 0.25 against 1.0 on New York's start
+     line changed nothing but animated signs. The same test drops objects under 1/480 of the screen (0x48CD3C, one
+     Xbox line; 0x3DF57 shares the constant), ~9 output pixels at 1080i x4, but that is km away for anything metres
+     across. Track data: .xb2 bundles and a .pvs (precomputed visibility) per track.
    Measured: the race timer moves 10.000 s in 600 presents at 60 and 11.9 s in ~12 s at 144; the start countdown takes
    5.9 s at 60 and 6.1 s at 30 (UILOG lines now end "at <ms>"). Presents never wait for the display any more
    (DXGI_PRESENT_DO_NOT_WAIT, three buffers): this thread holds the guest lock, and at 144 a present that waited for

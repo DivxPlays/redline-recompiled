@@ -146,7 +146,7 @@ static void input_start(void) {
 /* ports with a controller: 0 always (keyboard), others while that many pads are connected */
 static uint32_t connected_ports(void) {
     input_start();
-    uint32_t mask = 1;
+    uint32_t mask = getenv("TESTPAD2") ? 3 : 1; /* testing: TESTPAD2=1 adds port 1, held by test keys + 4096 */
     AcquireSRWLockShared(&g_lock);
     for (int i = 1; i < 4; i++)
         if (g_slot[i].pad) mask |= 1u << i;
@@ -314,6 +314,7 @@ static int ktrace_input(void) {
 
 /* TESTKEYS=<file>: test scripts hold keys by listing their virtual-key codes in the file, one a line, and the real
  * keyboard is ignored; the game needs no focus then, so a script leaves the desktop to whoever is using it */
+static int g_test2[256]; /* TESTPAD2: keys a script holds for port 1 (vk + 4096 in the file) */
 static int test_keys(int down[256]) {
     static const char *path;
     static int init, last[256];
@@ -330,8 +331,10 @@ static int test_keys(int down[256]) {
         CloseHandle(h);
         text[got] = 0;
         int now[256] = {0}, vk, used;
+        memset(g_test2, 0, sizeof g_test2);
         for (const char *t = text; sscanf(t, "%d%n", &vk, &used) == 1; t += used)
             if (vk > 0 && vk < 256) now[vk] = 1;
+            else if (vk > 4096 && vk < 4096 + 256) g_test2[vk - 4096] = 1;
         if (memcmp(now, last, sizeof now) && ktrace_input()) {
             fprintf(stderr, "[input] test keys:");
             for (int k = 0; k < 256; k++)
@@ -349,8 +352,8 @@ static void read_keyboard(Pad *p) {
     static int last_menu = -1, last_capture = -1;
     load_keys();
     int down[256], test = test_keys(down);
+    int menu = forza_menu_open(), capture = g_capture; /* first: it also follows the screens (achievements) */
     if (!test && !our_window_focused()) return;
-    int menu = forza_menu_open(), capture = g_capture;
     for (int vk = 8; vk < 256; vk++) {
         if (!test) down[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
         if (!down[vk]) g_stale[vk] = 0;
@@ -387,6 +390,15 @@ static void read_pad(uint32_t port, Pad *p) {
     else memset(p, 0, sizeof *p);
     ReleaseSRWLockShared(&g_lock);
     if (port == 0) read_keyboard(p);
+    if (port == 1 && !g_slot[1].pad && getenv("TESTPAD2")) { /* a script's second player: Enter/Space A, Esc B, arrows,
+                                                                 * Tab Start, W/S triggers, A/D steer */
+        const int *k = g_test2;
+        p->analog[AN_A] = k[13] || k[32] ? 255 : 0, p->analog[AN_B] = k[27] ? 255 : 0;
+        p->analog[AN_RT] = k['W'] ? 255 : 0, p->analog[AN_LT] = k['S'] ? 255 : 0;
+        p->buttons = (k[38] ? XB_UP : 0) | (k[40] ? XB_DOWN : 0) | (k[37] ? XB_LEFT : 0) | (k[39] ? XB_RIGHT : 0) |
+                     (k[9] ? XB_START : 0);
+        p->thumb[0] = k['A'] ? -32767 : k['D'] ? 32767 : 0;
+    }
 }
 
 /* ---------------- XPP replacements ---------------- */
@@ -423,7 +435,7 @@ void hle_XGetDeviceChanges(X86Ctx *c) {
 void hle_XInputOpen(X86Ctx *c) {
     uint32_t port = ARG(1);
     int ok = ARG(0) == DEVICE_TYPE_GAMEPAD && port < 4 && (connected_ports() >> port & 1);
-    if (ktrace()) fprintf(stderr, "[xinput] XInputOpen port %u -> %s\n", port, ok ? "ok" : "none");
+    if (ktrace() || ktrace_input()) fprintf(stderr, "[xinput] XInputOpen port %u -> %s\n", port, ok ? "ok" : "none");
     ret(c, ok ? HANDLE_BASE | port : 0, 4);
 }
 

@@ -1,16 +1,28 @@
 <p align="center"><img src="launcher/emblem.png" width="128" alt="Redline Recompiled emblem"></p>
 
-<h1 align="center">Redline Recompiled 0.1</h1>
+<h1 align="center">Redline Recompiled 0.2.0 alpha</h1>
 
 <p align="center">A PC port of <b>Forza Motorsport</b> (Xbox, 2005), made by static recompilation.</p>
 
 > [!WARNING]
-> **Early version.** Performance may be unstable, and expect bugs and crashes.
+> **Alpha.** It plays from start to finish, but performance may be unstable, and expect bugs and crashes.
 
 > [!NOTE]
 > **MADE WITH THE HELP OF AI.** This port was made with the help of AI: Anthropic's Claude (in Claude Code) wrote
 > and tested much of the code, the tools and these documents, working step by step with the project's author, who
 > played and checked the results.
+
+**Contents**
+
+- [Screenshots](#screenshots)
+- [What you need](#what-you-need)
+- [Install and play](#install-and-play)
+- [Controls](#controls)
+- [Settings](#settings)
+- [Achievements](#achievements)
+- [Optional: 4x textures and videos](#optional-4x-textures-and-videos)
+- [What does not work](#what-does-not-work)
+- [Licence and credits](#licence-and-credits)
 
 ![A race at 32:9, the HUD at the screen's edges](docs/images/race-ultrawide.jpg)
 
@@ -38,28 +50,28 @@ builds the port from **your own copy** of the disc, on your PC.
   at about 25 frames a second). DLSS needs an NVIDIA RTX card; FSR 3 runs on any DirectX 12 card.
 - **Your disc image of Forza Motorsport (USA) (Rev 1)**: an `.iso` file, or a folder with the disc's files
   (`Forza.xbe` and `media`). The launcher checks that it is this version; others are not supported.
-- **Python 3** from [python.org](https://www.python.org/downloads/) (tick "Add python.exe to PATH" when installing).
-  The launcher offers to install the three packages it needs (capstone, Pillow, numpy).
-- **Visual Studio C++ build tools**: the free
-  [Build Tools for Visual Studio](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the
-  "Desktop development with C++" workload (or Visual Studio with it).
-- **About 6 GB of disk space**, and an internet connection during the build: it downloads NVIDIA's DLSS and AMD's FSR
-  files from their GitHub pages (each file checked against a known checksum).
+- **Nothing to install.** The first build downloads its own tools (Python, the Capstone disassembler and the zig C
+  compiler, about 95 MB, from their makers' sites) into the port's `build\tools` folder, and NVIDIA's DLSS and AMD's
+  FSR files from their GitHub pages, each file checked against a known checksum. So it needs an internet connection
+  the first time.
+- **About 7 GB of disk space.**
+- **Memory**: the build needs about 1.5 GB of free RAM for each file it compiles at once and runs as many as fit, so
+  less memory only makes it slower. The game itself uses about 0.4 GB of RAM and 2 GB of video memory.
 
 ## Install and play
 
-1. Download **RedlineRecompiled-0.1.0.zip** from the [Releases](../../releases) page and unzip it anywhere you like
-   (a path without unusual characters is safest). (The green Code button's download has no launcher in it:
-   `python tools/build.py --launcher` makes one.)
+1. Download **RedlineRecompiled-0.2.0.zip** from the [Releases](../../releases) page and unzip it to a folder whose
+   path is short, at most 120 characters (for example `C:\Games\RedlineRecompiled`). (The green Code button's
+   download has no launcher in it: `python tools/build.py --launcher` makes one, with Visual Studio.)
 2. Run **RedlineLauncher.exe**.
-3. Drop your disc image (or the game folder) on the launcher, or choose it, then press **Build**. The build extracts
-   the disc, finds and translates the game's code, and compiles it; it takes a while, and the launcher shows each
-   step. If it stops, the launcher shows why.
+3. Drop your disc image (or the game folder) on the launcher, or choose it, then press **Build**. The build fetches
+   its tools, extracts the disc, finds and translates the game's code, and compiles it; the first one takes about 5
+   to 10 minutes, and the launcher shows each step. If it stops, the launcher shows why.
 4. Press **Play**.
 
 The game's files go to `game\`, your saves to `hdd\Partition1\UDATA` (the launcher's **Saves** link), and the game's
-log to `build\redline.log` (**Logs**). To update the port later, unzip the new version over this folder and press
-**Rebuild**: your saves and settings stay.
+log to `build\redline.log` (**Logs**). The launcher says when a newer version is out. To update, unzip the new
+version over this folder and press **Rebuild**: your saves and settings stay, and the launcher shows what's new.
 
 ## Controls
 
@@ -83,6 +95,10 @@ bottom face button is A); the right shoulder is the Xbox's Black button, the lef
 
 Both sets can be changed in the game: **Recomp Settings > Driving keys / Menu keys**.
 
+**The launcher** works with a controller too (or the arrow keys): the d-pad or stick moves between its buttons, A
+(Enter) chooses, B (Esc) goes back, and left and right change a setting. Choosing the disc opens Windows' own file
+picker, which needs a mouse, touch or the keyboard.
+
 ## Settings
 
 In the launcher (**Settings**) or in the game's main menu (**Recomp Settings**); they are the same settings.
@@ -94,6 +110,11 @@ In the launcher (**Settings**) or in the game's main menu (**Recomp Settings**);
   view on a 21:9 or 32:9 monitor, with the HUD at the screen's edges), **Video mode** (480p, 720p, 1080i).
 - **Enhanced audio** and **Speakers** (5.1 and 7.1 get the game's surround mix).
 - **Quit Game** is at the bottom of the main menu.
+
+## Achievements
+
+32 achievements that the original game never had: racing, career, garage, modes and tracks. Each one pops up when
+earned, and **Achievements** on the main menu lists them all. See [docs/achievements.md](docs/achievements.md).
 
 ## Optional: 4x textures and videos
 
@@ -110,8 +131,9 @@ hours and a fast GPU:
 ## What does not work
 
 Xbox Live (shut down long ago), System Link and anything else online. Split-screen with two controllers has not been
-tried. If the game stops with an error, it says so in a box and names the log: please include `build\redline.log`
-when you report it.
+tried. If the game stops with an error, it says so in a box, names the log and offers to report it: a new GitHub
+issue opens in your browser, filled in with the version and the end of the log (your user name and folders taken
+out). Nothing is sent unless you submit it.
 
 ## Licence and credits
 
@@ -119,7 +141,8 @@ Redline Recompiled's own code is under the [MIT licence](LICENSE); the files und
 
 It uses [SDL3](https://www.libsdl.org/) for controllers (zlib licence), function signatures from
 [XbSymbolDatabase](https://github.com/Cxbx-Reloaded/XbSymbolDatabase) (MIT licence code, ODbL data), the kernel export
-list from [nxdk](https://github.com/XboxDev/nxdk) (CC0), [Capstone](https://www.capstone-engine.org/) in the build tools
-(BSD licence), AMD FidelityFX Super Resolution (MIT licence; the signed FSR 3 libraries under AMD's licence), and
-NVIDIA DLSS (NVIDIA RTX SDK licence; DLSS is NVIDIA's). Forza Motorsport is Microsoft's; this project contains none
-of it.
+list from [nxdk](https://github.com/XboxDev/nxdk) (CC0), AMD FidelityFX Super Resolution (MIT licence; the signed
+FSR 3 libraries under AMD's licence), and NVIDIA DLSS (NVIDIA RTX SDK licence; DLSS is NVIDIA's). The build downloads
+and runs [Python](https://www.python.org/) (PSF licence), [Capstone](https://www.capstone-engine.org/) (BSD licence)
+and [zig](https://ziglang.org/) (MIT licence; it includes LLVM's clang and lld and mingw-w64), each with its own
+licence files. Forza Motorsport is Microsoft's; this project contains none of it.

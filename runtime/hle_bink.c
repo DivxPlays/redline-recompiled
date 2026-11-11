@@ -3,7 +3,7 @@
  * 0x4CE4B8), which keeps the Bink handle at +0x48 (and tries D:\MEDIA\placeholder.bik when a file is missing);
  * frames reach memory through BinkCopyToBuffer (0x3ACF90: bink, dest, pitch, height, x, y, flags), found among the
  * wrapper's calls into the library by its seven arguments. The handle starts {width, height, frames, frame number
- * (1-based)}. BINKLOG=1 logs both. */
+ * (1-based)}; its frame rate is +0x14 / +0x18, which BinkWait (0x3AC840) paces by. BINKLOG=1 logs both. */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -11,8 +11,8 @@
 
 #define ARG(i) M32(c->esp + 4 + 4 * (i))
 
-void o_003ACF90(X86Ctx *c); /* lifted originals */
-void o_003A99B0(X86Ctx *c);
+extern GuestFn o_003ACF90; /* lifted originals */
+extern GuestFn o_003A99B0;
 
 static int bink_log(void) {
     static int log = -1;
@@ -34,11 +34,26 @@ void hle_BinkCopyToBuffer(X86Ctx *c) {
 }
 
 void hle_BinkWrapperOpen(X86Ctx *c) {
+    static int fps;
     uint32_t wrapper = c->ecx, name = ARG(0), flags = ARG(1);
     char n[160] = "";
     for (int i = 0; name && i < 159 && M8(name + i); i++) n[i] = (char)M8(name + i), n[i + 1] = 0;
     o_003A99B0(c);
     uint32_t bink = M32(wrapper + 0x48);
-    if (bink_log()) fprintf(stderr, "[bink] open \"%s\" flags %08X -> %08X\n", n, flags, bink);
+    /* Flags 1 opens a video at the game's own frame rate (refresh / vblanks per frame): the event list's track
+     * flythroughs (Flythrough.bik, 29.97 fps), a frame per game frame, 30 on the Xbox (60 / 2). Above 30 that rate
+     * is 72-144 and they ran 2.4-4.8x fast: they get their file's own rate back (BIK header +28 / +32). */
+    if (!fps) fps = cfg_get("FRAMERATE", "framerate", 60);
+    if (bink && (flags & 1) && fps > 30 && n[0] && n[1] == ':') {
+        char p[512];
+        uint32_t h[9];
+        snprintf(p, sizeof p, "%s%s", guest_path_root(), n + 2); /* D: is the game folder */
+        FILE *f = fopen(p, "rb");
+        if (f && fread(h, 4, 9, f) == 9 && h[7] && h[8]) M32(bink + 0x14) = h[7], M32(bink + 0x18) = h[8];
+        if (f) fclose(f);
+    }
+    if (bink_log())
+        fprintf(stderr, "[bink] open \"%s\" flags %08X -> %08X at %u/%u fps\n", n, flags, bink, bink ? M32(bink + 0x14) : 0,
+                bink ? M32(bink + 0x18) : 0);
     video_open(bink, n);
 }

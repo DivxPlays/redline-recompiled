@@ -100,6 +100,8 @@ static uint32_t k_NtAllocateVirtualMemory(X86Ctx *c, const uint32_t *a) {
         M32(a[2]) = size;
         return STATUS_SUCCESS;
     }
+    /* 64 KiB-aligned as on the Xbox, where that costs only address space; here each 4 KiB VirtualAlloc leaves a 60 KiB
+     * hole. Page-aligned cut a 720p race load's heap top by 24 MB but crashed in 0027D540 (NOTES, GitHub #17) */
     uint32_t base = guest_alloc(size, 0x10000);
     M32(a[0]) = base;
     M32(a[2]) = size;
