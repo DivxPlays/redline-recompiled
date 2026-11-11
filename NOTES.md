@@ -508,6 +508,27 @@ Not for 0.1: Xbox Live (never), System Link, DES.
     16:9, off centre and cut off at 32:9, a black box where the car had been. texture_target() now never matches a
     compressed or palettised format (I8, DXT1/3/5: no render target is one); render_draw's rt_read uses it too, so
     the picture is a 2D draw (the middle 16:9 at ultrawide). Checked at 32:9 and 16:9.
+  - **#22 "fails to download python"** (Mungr3ss, 2026-11-11, on 0.2.1; the #18 reporter, whose Visual Studio
+    error 0.2.0 fixed): Build stops at the first tool, "The download failed (error 800C0008)" (INET_E_DOWNLOAD_FAILURE),
+    while the same python.org file downloads in their Firefox. fetch_tools() uses URLDownloadToFile, which goes
+    through Internet Explorer's settings (proxy, security zones, TLS options) and its download cache; Firefox uses
+    none of them. Plan: when it fails, fetch with Windows' own curl.exe (System32 since Windows 10 1803; its own HTTP
+    stack and no cache), and accept a download.zip the player saved by hand when its SHA-256 matches, with the
+    failure message saying where to put it. The message's "check the internet connection" misleads here.
+    **Fixed 2026-11-11** (0.2.2): fetch_tools() first uses a copy the player saved by hand (the URL's own
+    file name in Downloads or the port's folder, when its SHA-256 matches; it stays there); else URLDownloadToFile,
+    and when that fails, %SystemRoot%\System32\curl.exe -fsSL --retry 2 --ssl-no-revoke (curl_cmd(), through run(),
+    so Cancel stops it). If curl fails too, the log gives the URL and the headline "Download <file> in your browser
+    (the link is in the details), then press Build again". The update check falls back to curl too (silent, 30 s at
+    most), so such a PC still hears of the release that fixes it. Tested in Windows Sandbox with WinINet broken by a
+    refusing proxy in Internet Settings (error 800C0005; 800C0008 not reproduced): with curl broken too (HTTPS_PROXY)
+    the message; with Python saved in Downloads, used from there and kept; with curl working, all three tools through
+    curl and the update check's answer (v0.2.1-alpha).
+    Slow connections (sandbox, a proxy slowing what servers send, 2026-11-11): through curl at ~350 KB/s the tools
+    took 4.9 min (zig 4 min) and finished; the card showed only the tool's name then, so watch_size() now shows
+    "zig 0.14.1 (the C compiler), 5 of 82 MB" from the file's size every 0.5 s. Cancel during a slow download stops in
+    1.1 s, curl's or Windows' (its partial download.zip deleted). The update check's answer is ~10 KB with TLS: 11 s at
+    1 KB/s; at 150 B/s curl is stopped at 30 s, silently, the launcher responsive throughout (it needs ~350 B/s).
   - **C1002, compiler out of heap in pass 2** (#2, #3, #8, #16; Visual Studio 2026 and Build Tools 2022, 16 GB RAM,
     16 CPUs): recomp/funcs_039.c's f_002E5DC0, f_002E6930, f_002E74E0, f_002E8050 (~4,000 lines each), then D8040.
     **Fixed 2026-11-10** (not released): measured alone, funcs_039.c took 65.4 GB of commit to compile (it built here

@@ -1,6 +1,6 @@
 <p align="center"><img src="launcher/emblem.png" width="128" alt="Redline Recompiled emblem"></p>
 
-<h1 align="center">Redline Recompiled 0.2.1 alpha</h1>
+<h1 align="center">Redline Recompiled 0.2.2 alpha</h1>
 
 <p align="center">A PC port of <b>Forza Motorsport</b> (Xbox, 2005), made by static recompilation.</p>
 
@@ -8,7 +8,7 @@
 <a href="https://github.com/DivxPlays/redline-recompiled/releases/download/v0.2.0-alpha/trailer.mp4"><b>Watch the trailer</b></a> (1 minute)</p>
 
 > [!WARNING]
-> **Alpha.** It plays from start to finish, but performance may be unstable, and expect bugs and crashes.
+> **Alpha, version 0.2.2.** It plays from start to finish, but performance may be unstable, and expect bugs and crashes.
 
 > [!NOTE]
 > **MADE WITH THE HELP OF AI.** This port was made with the help of AI: Anthropic's Claude (in Claude Code) wrote
@@ -56,14 +56,15 @@ builds the port from **your own copy** of the disc, on your PC.
 - **Nothing to install.** The first build downloads its own tools (Python, the Capstone disassembler and the zig C
   compiler, about 95 MB, from their makers' sites) into the port's `build\tools` folder, and NVIDIA's DLSS and AMD's
   FSR files from their GitHub pages, each file checked against a known checksum. So it needs an internet connection
-  the first time.
+  the first time. If a download fails while your browser works, the launcher names the file: download it in your
+  browser, leave it in your Downloads folder and press Build again.
 - **About 7 GB of disk space.**
 - **Memory**: the build needs about 1.5 GB of free RAM for each file it compiles at once and runs as many as fit, so
   less memory only makes it slower. The game itself uses about 0.4 GB of RAM and 2 GB of video memory.
 
 ## Install and play
 
-1. Download **RedlineRecompiled-0.2.1.zip** from the [Releases](../../releases) page and unzip it to a folder whose
+1. Download **RedlineRecompiled-0.2.2.zip** from the [Releases](../../releases) page and unzip it to a folder whose
    path is short, at most 120 characters (for example `C:\Games\RedlineRecompiled`). (The green Code button's
    download has no launcher in it: `python tools/build.py --launcher` makes one, with Visual Studio.)
 2. Run **RedlineLauncher.exe**.

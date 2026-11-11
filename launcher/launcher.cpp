@@ -203,6 +203,15 @@ static void update_from(const char *path) {
     free(tag), free(json);
 }
 
+/* Windows' own curl fetching url to out, for when URLDownloadToFile fails: that goes through Internet Explorer's
+ * settings and cache, which can be broken while browsers work (#22); curl uses neither. No revocation check: the
+ * tools' pinned SHA-256 already proves them, and the update check only reads a version */
+static void curl_cmd(char *cmd, size_t n, const char *out, const char *url) {
+    char curl[MAX_PATH];
+    ExpandEnvironmentStringsA("%SystemRoot%\\System32\\curl.exe", curl, MAX_PATH);
+    snprintf(cmd, n, "\"%s\" -fsSL --retry 2 --ssl-no-revoke -o \"%s\" \"%s\"", curl, out, url);
+}
+
 /* at most once a day, in the background: ask GitHub for the latest release. Offline, or anything wrong, it says
  * nothing. Nothing is downloaded but the answer, and nothing installed: the player follows the link or not. */
 static DWORD WINAPI update_thread(void *arg) {
@@ -214,7 +223,18 @@ static DWORD WINAPI update_thread(void *arg) {
     /* the day in the address: not yesterday's answer from Windows' download cache */
     snprintf(url, sizeof url, "https://api.github.com/repos/" REPO "/releases/latest?day=%s", day);
     CreateDirectoryA("build", NULL);
-    if (FAILED(URLDownloadToFileA(NULL, url, tmp, 0, NULL))) return 0;
+    if (FAILED(URLDownloadToFileA(NULL, url, tmp, 0, NULL))) {
+        char cmd[MAX_PATH * 3];
+        curl_cmd(cmd, sizeof cmd, tmp, url);
+        STARTUPINFOA si = {sizeof si};
+        PROCESS_INFORMATION pi;
+        DWORD code = 1;
+        if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) return 0;
+        if (WaitForSingleObject(pi.hProcess, 30000) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess), CloseHandle(pi.hThread);
+        if (code) return 0;
+    }
     MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
     WritePrivateProfileStringA("launcher", "update_check_day", day, g_ini);
     update_from(path);
@@ -418,6 +438,42 @@ struct DownloadProgress : IBindStatusCallback {
     HRESULT STDMETHODCALLTYPE OnObjectAvailable(REFIID, IUnknown *) { return S_OK; }
 };
 
+/* curl's download so far in the build card, from its file's size (curl has no callback like URLDownloadToFile's) */
+struct Watch {
+    const char *what, *file;
+    int mb;
+    volatile LONG on;
+};
+static DWORD WINAPI watch_size(void *p) {
+    Watch *w = (Watch *)p;
+    for (; w->on; Sleep(500)) {
+        WIN32_FILE_ATTRIBUTE_DATA a;
+        char s[96];
+        if (!GetFileAttributesExA(w->file, GetFileExInfoStandard, &a)) continue;
+        snprintf(s, sizeof s, "%s, %lu of %d MB", w->what, a.nFileSizeLow / 1000000, w->mb); /* g_tools' unit */
+        set_detail(s);
+    }
+    return 0;
+}
+
+/* a tool the player downloaded in their browser (the failed download says how), by its own name in the Downloads
+ * folder or the port's: used when its SHA-256 matches */
+static int saved_copy(const char *url, const char *sha256, char *out) {
+    char dirs[2][MAX_PATH] = {}, hex[65];
+    snprintf(dirs[0], MAX_PATH, "%s", g_root);
+    PWSTR w;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, NULL, &w))) {
+        WideCharToMultiByte(CP_ACP, 0, w, -1, dirs[1], MAX_PATH, NULL, NULL);
+        CoTaskMemFree(w);
+    }
+    for (int d = 0; d < 2; d++) {
+        snprintf(out, MAX_PATH, "%s\\%s", dirs[d], strrchr(url, '/') + 1);
+        if (dirs[d][0] && exists(out) && hash_file(out, BCRYPT_SHA256_ALGORITHM, 32, hex) && !strcmp(hex, sha256))
+            return 1;
+    }
+    return 0;
+}
+
 /* g_tools, each fetched once: download, check, unpack with Windows' tar. A tool counts as there by its .ok file,
  * written only once it unpacked whole (Cancel during the unpacking leaves its files but no .ok, so the next Build
  * fetches it again) */
@@ -435,31 +491,50 @@ static int fetch_tools(void) {
         }
         snprintf(dir, sizeof dir, "%s\\%s", g_root, g_tools[i].dir);
         SHCreateDirectoryExA(NULL, dir, NULL);
-        snprintf(zip, sizeof zip, "%s\\download.zip", dir);
-        post_log("Downloading %s, %d MB: %s\r\n", g_tools[i].what, g_tools[i].mb, g_tools[i].url);
-        DownloadProgress progress;
-        progress.what = g_tools[i].what;
-        HRESULT hr = URLDownloadToFileA(NULL, g_tools[i].url, zip, 0, &progress);
-        set_detail("");
-        if (g_cancel) {
-            DeleteFileA(zip);
-            return 0;
-        }
-        if (FAILED(hr)) {
-            post_log("The download failed (error %08lX). Check the internet connection, then press Build again.\r\n", hr);
-            return 0;
-        }
-        if (!hash_file(zip, BCRYPT_SHA256_ALGORITHM, 32, hex) || strcmp(hex, g_tools[i].sha256)) {
-            DeleteFileA(zip);
-            post_log("%s did not match its checksum, so it was not used (a broken download, or not the file it should "
-                     "be). Press Build to try again.\r\n", g_tools[i].what);
-            return 0;
+        int saved = saved_copy(g_tools[i].url, g_tools[i].sha256, zip);
+        if (saved) post_log("Using %s from %s\r\n", g_tools[i].what, zip);
+        else {
+            snprintf(zip, sizeof zip, "%s\\download.zip", dir);
+            post_log("Downloading %s, %d MB: %s\r\n", g_tools[i].what, g_tools[i].mb, g_tools[i].url);
+            DownloadProgress progress;
+            progress.what = g_tools[i].what;
+            HRESULT hr = URLDownloadToFileA(NULL, g_tools[i].url, zip, 0, &progress);
+            if (FAILED(hr) && !g_cancel) {
+                post_log("Windows' download failed (error %08lX), so trying with curl.\r\n", hr);
+                set_detail(g_tools[i].what);
+                DeleteFileA(zip);
+                curl_cmd(cmd, sizeof cmd, zip, g_tools[i].url);
+                Watch watch = {g_tools[i].what, zip, g_tools[i].mb, 1};
+                HANDLE t = CreateThread(NULL, 0, watch_size, &watch, 0, NULL);
+                if (run(cmd) == 0) hr = S_OK;
+                watch.on = 0;
+                if (t) WaitForSingleObject(t, INFINITE), CloseHandle(t);
+            }
+            set_detail("");
+            if (g_cancel) {
+                DeleteFileA(zip);
+                return 0;
+            }
+            if (FAILED(hr)) {
+                DeleteFileA(zip);
+                post_log("The download failed with curl too. If the internet works in your browser, download this file "
+                         "there and leave it in your Downloads folder:\r\n%s\r\n", g_tools[i].url);
+                post_log("Download %s in your browser (the link is in the details), then press Build again.\r\n",
+                         strrchr(g_tools[i].url, '/') + 1);
+                return 0;
+            }
+            if (!hash_file(zip, BCRYPT_SHA256_ALGORITHM, 32, hex) || strcmp(hex, g_tools[i].sha256)) {
+                DeleteFileA(zip);
+                post_log("%s did not match its checksum, so it was not used (a broken download, or not the file it "
+                         "should be). Press Build to try again.\r\n", g_tools[i].what);
+                return 0;
+            }
         }
         snprintf(cmd, sizeof cmd, "\"%s\" -xf \"%s\" -C \"%s\"", tar, zip, dir);
         set_detail("unpacking");
         DWORD code = run(cmd);
         set_detail("");
-        DeleteFileA(zip);
+        if (!saved) DeleteFileA(zip); /* the player's own copy stays theirs */
         if (code || !exists(check)) {
             if (!g_cancel) post_log("Unpacking %s failed.\r\n", g_tools[i].what);
             return 0;

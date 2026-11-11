@@ -11,6 +11,15 @@
 - ...
 -->
 
+## 0.2.2 Alpha (2026-11-11)
+
+### Fixed
+- Build no longer stops with "The download failed (error 800C0008)" on PCs where the browser downloads fine: when
+  Windows' download fails, the launcher tries again with curl (built into Windows). If that fails too, it names the
+  file to download in your browser, and Build takes it from your Downloads folder. The update check uses curl the
+  same way, so those PCs are told about new versions too. (#22)
+- While the launcher downloads a build tool that way, the build card shows how far it has got ("5 of 82 MB").
+
 ## 0.2.1 Alpha (2026-11-10)
 
 ### Fixed
