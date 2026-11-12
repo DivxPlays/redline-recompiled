@@ -25,7 +25,7 @@ roadmap; there's no ROADMAP.md. Changes per version: `CHANGELOG.md`. For players
 ## House rules
 
 - **Commit every change; push only clean history.** GitHub (`DivxPlays/redline-recompiled`, public, branch `main`)
-  holds one squashed commit per release (0.1.0, 0.2.0 alpha, 0.2.1 alpha, 0.2.2 alpha), made with the no-reply identity on the local branch
+  holds one squashed commit per release (0.1.0, 0.2.0 alpha, 0.2.1 alpha, 0.2.2 alpha, 0.2.3 alpha), made with the no-reply identity on the local branch
   `github-main` (`git commit-tree HEAD^{tree} -p github-main`). The local branches `feat/nv2a-draws` and
   `main` hold 90 commits made with an old email: never push them as they are (the kit's guard blocks it). Ask the
   user how to publish new work, for example as a fresh squashed commit like 0.1.0. Make that commit before the
@@ -109,13 +109,13 @@ roadmap; there's no ROADMAP.md. Changes per version: `CHANGELOG.md`. For players
 - **Versions are the user's call:** after a meaningful batch of changes, suggest a bump (x.y.Z fixes, x.Y.0 features,
   X.0.0 overhaul) and a stage (pre-alpha, alpha, pre-beta, beta, release) with what it covers. Only on their yes,
   release it following NOTES.md "Release checklist": the version lives in `runtime/version.h` (`RECOMP_VERSION`),
-  and in README.md's title, zip name and Alpha note ("version 0.2.2": the line the kit's guard reads; without it the
-  guard takes the trailer link's v0.2.0), and `python tools/package.py` builds `dist/RedlineRecompiled-<version>.zip`. Current: `0.2.2` in version.h; the
-  last release is v0.2.2-alpha (2026-11-11). Publish every release as a full release, alphas too (no
+  and in README.md's title, zip name and Alpha note ("version 0.2.3": the line the kit's guard reads; without it the
+  guard takes the trailer link's v0.2.0), and `python tools/package.py` builds `dist/RedlineRecompiled-<version>.zip`. Current: `0.2.3` in version.h; the
+  last release is v0.2.3-alpha (2026-11-11). Publish every release as a full release, alphas too (no
   `--prerelease`; the stage stays in its title): GitHub shows only a full release as "Latest" on the repo page,
   and the launcher's update checker reads `/releases/latest`, which skips pre-releases (the user, 2026-11-10).
 - **Show the name and version in the launcher and the game** (the user asked on 2026-11-10), both read from
-  `RECOMP_VERSION`. The game already draws `Redline Recompiled v0.2.2` in the bottom-right corner (`version_text` in
-  `runtime/render.c`) and in the window title, and the launcher's footer shows `Redline Recompiled 0.2.2`
+  `RECOMP_VERSION`. The game already draws `Redline Recompiled v0.2.3` in the bottom-right corner (`version_text` in
+  `runtime/render.c`) and in the window title, and the launcher's footer shows `Redline Recompiled 0.2.3`
   (`draw()` in `launcher/launcher.cpp`). Keep both.
 - `gh` isn't on Git Bash's PATH: use `"/c/Program Files/GitHub CLI/gh.exe"`.

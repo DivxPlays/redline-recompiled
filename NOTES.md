@@ -529,6 +529,19 @@ Not for 0.1: Xbox Live (never), System Link, DES.
     "zig 0.14.1 (the C compiler), 5 of 82 MB" from the file's size every 0.5 s. Cancel during a slow download stops in
     1.1 s, curl's or Windows' (its partial download.zip deleted). The update check's answer is ~10 KB with TLS: 11 s at
     1 KB/s; at 150 B/s curl is stopped at 30 s, silently, the launcher responsive throughout (it needs ~350 B/s).
+  - **#23 "Unknown error"** (tfundeca, 2026-11-11, Portuguese Windows, 18 GB free on C:, which is enough): two logs.
+    - C1002 on funcs_039.c in `C:\Games\RedlineRecompiled-0.1.0`, which they took for the new version. The log runs
+      `py -3` and Visual Studio's cl, which only 0.1.0's launcher does (0.2.x runs build\tools' Python and
+      `build.py --zig`), so 0.1.0's launcher and lift.py ran: the 0.2.2 zip didn't replace them (unzipped elsewhere,
+      or "Skip" at Windows' replace prompt). Answer: a fresh folder, and the footer must say 0.2.2.
+    - A Redump image (`Forza Motorsport (USA) (En,Ja,Fr,De,Es,It,Pt,Zh,Ko) (Rev 1).iso`) stops at "not an XDVDFS
+      image (magic missing at sector 32)". xiso_extract.py reads only plain XISOs. A full-disc dump has the video
+      partition first and the game's XDVDFS volume at 0x18300000 (XGD1; XGD2 0xFD90000, XGD3 0x2080000, as
+      extract-xiso), with directory sectors relative to it. Still so in 0.2.2. Their extracted folder got past it.
+      **Fixed 2026-11-11** (0.2.3): xiso_extract.py looks for the volume at those offsets (0 first) and adds
+      its start to every seek. Tested on made-up images (an XISO; a full-disc one at 0x18300000, which the old code
+      failed with the player's message; junk: "This .iso is not an Xbox disc image") and on the owner's XISO
+      (identical to game\, Forza.xbe's SHA-1 right). Not tried on a real full-disc dump of Forza.
   - **C1002, compiler out of heap in pass 2** (#2, #3, #8, #16; Visual Studio 2026 and Build Tools 2022, 16 GB RAM,
     16 CPUs): recomp/funcs_039.c's f_002E5DC0, f_002E6930, f_002E74E0, f_002E8050 (~4,000 lines each), then D8040.
     **Fixed 2026-11-10** (not released): measured alone, funcs_039.c took 65.4 GB of commit to compile (it built here

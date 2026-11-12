@@ -1,4 +1,4 @@
-"""Extract an Xbox XDVDFS (XISO) image.
+"""Extract an Xbox XDVDFS image: an XISO, or a full-disc (Redump) dump.
 
 Usage: python tools/xiso_extract.py <image.iso> <out_dir>
 """
@@ -8,14 +8,22 @@ import sys
 
 SECTOR = 2048
 MAGIC = b"MICROSOFT*XBOX*MEDIA"
+# Where the game's XDVDFS volume starts: 0 in an XISO; in a full-disc dump, after the disc's video partition, at
+# extract-xiso's offsets for XGD1 (every original Xbox disc), XGD2 and XGD3. Its sector numbers count from there.
+VOLUME_OFFSETS = (0, 0x18300000, 0x0FD90000, 0x02080000)
 
 
 def extract(iso_path, out_dir):
     with open(iso_path, "rb") as f:
-        f.seek(32 * SECTOR)
-        vd = f.read(SECTOR)
-        if vd[:20] != MAGIC or vd[0x7EC:0x800] != MAGIC:
-            sys.exit("not an XDVDFS image (magic missing at sector 32)")
+        for base in VOLUME_OFFSETS:
+            f.seek(base + 32 * SECTOR)
+            vd = f.read(SECTOR)
+            if vd[:20] == MAGIC and vd[0x7EC:0x800] == MAGIC:
+                break
+        else:
+            sys.exit("This .iso is not an Xbox disc image: no XDVDFS volume where an XISO or a full-disc dump has one.")
+        if base:
+            print(f"a full-disc image: the game's volume starts at {base:#x}")
         root_sector, root_size = struct.unpack_from("<II", vd, 20)
         count = 0
         total = 0
@@ -24,7 +32,7 @@ def extract(iso_path, out_dir):
             nonlocal count, total
             if dir_size == 0:
                 return
-            f.seek(dir_sector * SECTOR)
+            f.seek(base + dir_sector * SECTOR)
             table = f.read(dir_size)
             seen = set()
 
@@ -48,7 +56,7 @@ def extract(iso_path, out_dir):
                     os.makedirs(target, exist_ok=True)
                     walk(sector, size, target)
                 else:
-                    f.seek(sector * SECTOR)
+                    f.seek(base + sector * SECTOR)
                     remaining = size
                     with open(target, "wb") as out:
                         while remaining:

@@ -11,6 +11,12 @@
 - ...
 -->
 
+## 0.2.3 Alpha (2026-11-11)
+
+### Fixed
+- Build no longer stops at "not an XDVDFS image" with a full-disc dump of the game (the kind Redump makes, with the
+  disc's video partition first): the launcher finds the game in it, as in the smaller XISO kind. (#23)
+
 ## 0.2.2 Alpha (2026-11-11)
 
 ### Fixed
