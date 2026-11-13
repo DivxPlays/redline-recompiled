@@ -7,6 +7,7 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <mmreg.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,8 +49,65 @@ static void record(const float *buf, uint32_t frames) {
     want = 0;
 }
 
+/* the achievement sound (render.c's pop-up), as the owner chose it: the first 3.5 s of the game's own fanfare
+ * (FanFare in media\Audio\UISounds.xwb, Xbox ADPCM, 44.1 kHz stereo), read from the player's disc the first time,
+ * faded in over 10 ms and out over its last 0.8 s, at -6 dBFS peak (x0.55), resampled to 48 kHz and added to the
+ * front pair. Without the bank, silence */
+static float *g_chime;
+static uint32_t g_chime_n;
+static volatile LONG g_chime_pos = -1;
+static void chime_make(void) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%s\\media\\Audio\\UISounds.xwb", guest_path_root());
+    FILE *f = fopen(path, "rb");
+    long size = f && !fseek(f, 0, SEEK_END) ? ftell(f) : 0;
+    uint8_t *d = size > 48 ? malloc(size) : NULL;
+    if (f) fseek(f, 0, SEEK_SET);
+    if (!d || fread(d, 1, size, f) != (size_t)size || memcmp(d, "WBND", 4)) size = 0;
+    if (f) fclose(f);
+#define U32(o) ((uint64_t)(o) + 4 <= (uint64_t)size ? *(const uint32_t *)(d + (o)) : 0)
+    /* an XACT wave bank: regions {offset, length} for the bank, the entries {flags, format, offset, length, ...}, their
+     * names and the wave data; the format's tag (1: Xbox ADPCM), channels and rate in bits 0-1, 2-4, 5-22 */
+    uint32_t bank = U32(8), meta = U32(16), names = U32(24), names_len = U32(28), wave = U32(32);
+    uint32_t count = U32(bank + 4), meta_size = U32(bank + 24), name_size = U32(bank + 28);
+    for (uint32_t i = 0; size && name_size && (uint64_t)names + names_len <= (uint64_t)size && i < count &&
+                         (uint64_t)(i + 1) * name_size <= names_len; i++) {
+        if (strncmp((const char *)d + names + i * name_size, "FanFare", name_size)) continue;
+        uint32_t m = meta + i * meta_size, fmt = U32(m + 4), off = U32(m + 8), len = U32(m + 12);
+        uint32_t ch = (fmt >> 2) & 7, rate = (fmt >> 5) & 0x3FFFF, blocks = len / (36 * 2), want = rate * 7 / 2;
+        if ((fmt & 3) != 1 || ch != 2 || rate < 8000 || (uint64_t)wave + off + len > (uint64_t)size || blocks * 65 <= want) break;
+        int16_t *pcm = malloc((size_t)blocks * 65 * 2 * sizeof(int16_t));
+        g_chime_n = (uint32_t)((uint64_t)want * AUDIO_RATE / rate);
+        float *out = pcm ? malloc((size_t)g_chime_n * 2 * sizeof(float)) : NULL;
+        for (uint32_t b = 0; out && b < blocks; b++) adpcm_block(d + wave + off + b * 72, 2, pcm + b * 65 * 2);
+        for (uint32_t k = 0; out && k < g_chime_n; k++) {
+            double at = (double)k * rate / AUDIO_RATE;
+            uint32_t s = (uint32_t)at;
+            float fr = (float)(at - s), t = (float)k / AUDIO_RATE, left = (float)(g_chime_n - k) / AUDIO_RATE, x;
+            float g = 0.55f / 32768 * (t < 0.01f ? t / 0.01f : 1) * (left < 0.8f ? (x = cosf((0.8f - left) / 0.8f * 1.5707963f)) * x : 1);
+            for (int c = 0; c < 2; c++) out[2 * k + c] = g * ((1 - fr) * pcm[2 * s + c] + fr * pcm[2 * (s + 1) + c]);
+        }
+        free(pcm);
+        if (out) g_chime = out, fprintf(stderr, "[audio] achievement sound: FanFare from UISounds.xwb, %.1f s\n", 3.5);
+        break;
+    }
+#undef U32
+    if (!g_chime) fprintf(stderr, "[audio] achievement sound: FanFare not found in %s; the pop-up is silent\n", path);
+    free(d);
+}
+void audio_chime(void) {
+    static int made;
+    if (!cfg_saved("achsound", 1)) return; /* ACHIEVEMENT SOUND off */
+    if (!made++) chime_make(); /* the first time: the game's files are known by then */
+    if (g_chime) InterlockedExchange(&g_chime_pos, 0);
+}
+
 static void pull(float *buf, uint32_t frames) {
     g_mix(buf, frames, g_mixed);
+    LONG at = g_chime_pos, pos = at;
+    for (uint32_t i = 0; g_chime && pos >= 0 && i < frames && (uint32_t)pos < g_chime_n; i++, pos++)
+        buf[(size_t)i * g_mixed] += g_chime[2 * pos], buf[(size_t)i * g_mixed + 1] += g_chime[2 * pos + 1];
+    if (at >= 0) InterlockedCompareExchange(&g_chime_pos, (uint32_t)pos >= g_chime_n ? -1 : pos, at); /* unless restarted */
     record(buf, frames);
     if (g_device == 8) /* 7.1 from 5.1, in place from the end: the back pair to the sides, and softer to the back */
         for (uint32_t i = frames; i-- > 0;) {
@@ -78,6 +136,7 @@ static void run_timer(void) {
 }
 
 static DWORD WINAPI audio_thread(void *p) {
+    thread_name("audio");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     IMMDeviceEnumerator *en = NULL;
     IMMDevice *dev = NULL;

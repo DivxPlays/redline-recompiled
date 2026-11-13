@@ -34,14 +34,30 @@ void hle_ForzaDisplayModeSupported(X86Ctx *c) {
  * vblanks per frame / refresh, frame-time mode 0 at 0x5188FC): a fixed 1/30 s, so the game is locked at 30 and a
  * frame drawn late slows it. Above 30, vblanks per frame is 1 (ONE_OR_IMMEDIATE: every vblank may bring a frame), the
  * vblank runs at the rate chosen (thread.c), and the refresh the step divides by follows how many vblanks the last
- * frame actually took (144 / 3 = 48: 1/48 s), so the game keeps real time at whatever rate it manages (a race makes
- * ~65 a second today: the emulated GPU works under the guest lock). Not vblanks per frame itself: the game rebuilds
+ * frame actually took (144 / 3 = 48: 1/48 s), so the game keeps real time at whatever rate it manages. Not vblanks
+ * per frame itself: the game rebuilds
  * its presentation interval from that, and a slow frame then locked it to every third vblank. */
 int g_vblank_hz = 60; /* the emulated vblank's rate (thread.c) */
 static int g_fps, g_autodrive;
 
+/* FRAME RATE AUTO: the refresh rate of the screen the window opens on, so each frame is on screen for one refresh (60
+ * a second on a 144 Hz screen without G-Sync / FreeSync showed each for 2 and 3 refreshes in turn: a judder). Windows
+ * gives 59.94 Hz as 59; past 165 it is halved (240 -> 120), and 60 is the least. */
+static int screen_rate(void) {
+    DEVMODEA dm = {.dmSize = sizeof dm};
+    int f = EnumDisplaySettingsA(render_screen(), ENUM_CURRENT_SETTINGS, &dm) ? (int)dm.dmDisplayFrequency : 60;
+    static const int common[] = {60, 75, 90, 100, 120, 144, 165, 240}; /* 59 -> 60, 143 -> 144, 164 -> 165... */
+    for (int i = 0; i < 8; i++)
+        if (f + 1 == common[i]) f++;
+    while (f > 165) f /= 2;
+    return f < 60 ? 60 : f;
+}
+
+int forza_fps(void) { return g_fps; }
+
 void forza_init(void) {
-    g_fps = cfg_get("FRAMERATE", "framerate", 60);
+    g_fps = cfg_get("FRAMERATE", "framerate", 0);
+    if (!g_fps) fprintf(stderr, "[forza] frame rate: auto, %d (the screen's refresh rate)\n", g_fps = screen_rate());
     if (g_fps > 60) g_vblank_hz = g_fps;
     if (g_fps != 30) M32(0x554F24u) = 1; /* before the game builds its presentation interval from it */
     g_autodrive = getenv("AUTODRIVE") != NULL;
@@ -132,7 +148,7 @@ void forza_vblank(void) {
 /* ---------------- Recomp Settings menu ----------------
  * Main menu items after OPTIONS: ACHIEVEMENTS (page 4), RECOMP SETTINGS and QUIT GAME. RECOMP SETTINGS opens a
  * screen built like Options (0x15A870: a title, then items added by 0x199580(label, description, icon, screen factory,
- * 0)) whose rows are this port's settings and two pages of keyboard keys. A row's "factory" (called with ecx = the row's holder, which tells the rows apart) cycles its value in
+ * 0)) whose rows are this port's settings and pages of keyboard keys and controller buttons. A row's "factory" (called with ecx = the row's holder, which tells the rows apart) cycles its value in
  * recomp.ini, starts waiting for a new key, or opens a page; one that returns no screen is taken as a return to this
  * one. Menu text is a LocString {own text, -, string table 0x5BB308, u16 id} resolved by the table's Lookup (0x340C0)
  * whenever it is drawn, so ids from 0xF000 up are answered here, with the values as saved. */
@@ -147,15 +163,20 @@ extern GuestFn o_00098230;
 
 typedef struct {
     const char *key, *label, *desc; /* descriptions get three lines of about 37 characters */
-    int def, n, values[5];
-    const char *names[5];
+    int def, n, values[8];
+    const char *names[8];
     void (*apply)(int value); /* now, or NULL: at the next start */
 } Setting;
 static const Setting g_settings[] = {
+    {"language", "LANGUAGE", "The language of the game's menus and text. Takes effect the next time the game starts.",
+     1, 8, {1, 3, 4, 5, 6, 2, 7, 8}, {"ENGLISH", "GERMAN", "FRENCH", "SPANISH", "ITALIAN", "JAPANESE", "KOREAN", "CHINESE"},
+     NULL},
     {"widescreen", "WIDESCREEN", "Native 16:9 picture instead of 4:3. Takes effect the next time the game starts.",
      1, 2, {1, 0}, {"ON", "OFF"}, NULL},
     {"ultrawide", "ULTRAWIDE", "A wider view on an ultrawide screen; the HUD and menus stay 16:9. Takes effect the next time the game starts.",
      0, 2, {0, 1}, {"OFF", "ON"}, NULL},
+    {"menusides", "MENU SIDES", "With ULTRAWIDE: the menus' sides filled from their picture, blurred, or black as before.",
+     1, 2, {1, 0}, {"FILLED", "BLACK"}, render_menusides},
     {"videomode", "VIDEO MODE", "Render resolution; 720p and 1080i are HD. Takes effect the next time the game starts.",
      480, 3, {480, 720, 1080}, {"480P", "720P", "1080I"}, NULL},
     {"renderscale", "RENDER SCALE", "Draws each frame this many times larger; sharper, but slower. Takes effect at the next start.",
@@ -166,10 +187,14 @@ static const Setting g_settings[] = {
      DEF_ANISOTROPY, 5, {1, 2, 4, 8, 16}, {"OFF", "2X", "4X", "8X", "16X"}, render_anisotropy},
     {"fsr", "UPSCALING", "DLSS (NVIDIA RTX) and FSR 3 rebuild the picture from several frames; FSR 1 sharpens one.",
      DEF_FSR, 4, {1, 2, 3, 0}, {"FSR 1", "DLSS", "FSR 3", "BILINEAR"}, render_fsr},
-    {"framerate", "FRAME RATE", "30 as on the Xbox. Above 60, races reach as many as this PC draws (~65 now). Takes effect at the next start.",
-     60, 4, {60, 120, 144, 30}, {"60", "120", "144", "30"}, NULL},
+    {"framerate", "FRAME RATE", "AUTO: the screen's refresh rate, so frames come evenly. 30 as on the Xbox. Takes effect at the next start.",
+     0, 5, {0, 60, 120, 144, 30}, {"AUTO", "60", "120", "144", "30"}, NULL},
     {"prompts", "BUTTON PROMPTS", "The buttons the game shows. AUTO follows the keyboard or controller last used.",
      0, 5, {0, 1, 2, 3, 4}, {"AUTO", "KEYBOARD", "XBOX", "PLAYSTATION", "ORIGINAL"}, input_set_prompts},
+    {"shoulders", "SHIFT ON SHOULDERS", "Controllers in a race: RB shifts up, LB down; camera and HUD move to the right and left stick clicks.",
+     0, 2, {0, 1}, {"OFF", "ON"}, input_set_shoulders},
+    {"rumble", "RUMBLE STRENGTH", "How hard controllers rumble. Options > Controller Options turns it off.", 100, 4,
+     {100, 75, 50, 25}, {"100%", "75%", "50%", "25%"}, input_set_rumble},
     {"texpack", "TEXTURE PACK", "Replacement textures from the textures folder, such as the 4x upscaled pack.",
      1, 2, {1, 0}, {"ON", "OFF"}, render_texpack},
     {"videos", "UPSCALED VIDEOS", "The cutscenes upscaled 4x, from the videos folder, in place of the originals.",
@@ -178,6 +203,8 @@ static const Setting g_settings[] = {
      1, 2, {1, 0}, {"ON", "OFF"}, fx_enable},
     {"speakers", "SPEAKERS", "AUTO plays the game's 5.1 mix on 5.1 and 7.1 speakers. Takes effect at the next start.",
      0, 2, {0, 1}, {"AUTO", "STEREO"}, NULL},
+    {"achsound", "ACHIEVEMENT SOUND", "The game's fanfare when an achievement pops up.", 1, 2, {1, 0}, {"ON", "OFF"},
+     NULL}, /* read at each pop-up (audio.c) */
     {"texdump", "TEXTURE DUMP", "Saves every new texture to textures/dump, to make a texture pack from.",
      0, 2, {0, 1}, {"OFF", "ON"}, render_texdump},
 };
@@ -191,19 +218,22 @@ static int setting_index(int i) { /* of the saved value; the first if it is none
     return 0;
 }
 
-/* screens: 0 Recomp Settings, 1 driving keys, 2 menu keys, 3 quit, 4 achievements; the rows of all of them in one list */
-enum { R_SETTING, R_PAGE, R_KEY, R_QUIT, R_ACH };
+/* screens: 0 Recomp Settings, 1 driving keys, 2 menu keys, 3 quit, 4 achievements, 5 controller buttons, 6 mods; the
+ * rows of all of them in one list */
+enum { R_SETTING, R_PAGE, R_KEY, R_QUIT, R_ACH, R_PAD, R_PADRESET, R_MOD };
 typedef struct {
     int screen, kind, i, menu;
 } Row;
 static Row g_rows[(SLOTS - 2) / 2];
 static int g_nrows;
-static const char *const g_pages[5][2] = {
+static const char *const g_pages[7][2] = {
     {"", ""},
     {"DRIVING KEYS", "Keyboard keys for racing. The arrow keys also steer, accelerate and brake."},
     {"MENU KEYS", "Keyboard keys for the menus and the pause menu."},
     {"QUIT GAME", "Close the game and return to Windows."},
-    {"ACHIEVEMENTS", "What this profile has earned, and how to earn the rest."}};
+    {"ACHIEVEMENTS", "What this profile has earned, and how to earn the rest."},
+    {"CONTROLLER BUTTONS", "A controller's buttons for racing. They stay yours in every controller layout."},
+    {"MODS", "Players' mods: folders in the mods folder whose files take the place of the disc's."}};
 #define QUIT_ROW (NSETTINGS + 2) /* the main menu's QUIT GAME and its screen's title, listed on no screen (-1) */
 #define ACH_ROW (NSETTINGS + 4)  /* the main menu's ACHIEVEMENTS, likewise */
 
@@ -218,6 +248,11 @@ static void build_rows(void) {
     for (int i = 0; i < achieve_count(); i++) g_rows[g_nrows++] = (Row){4, R_ACH, i, 0};
     for (int menu = 0; menu < 2; menu++)
         for (int k = 0; k < input_nbindings(menu); k++) g_rows[g_nrows++] = (Row){1 + menu, R_KEY, k, menu};
+    g_rows[g_nrows++] = (Row){0, R_PAGE, 5, 0}; /* after MENU KEYS: screen 0's rows show in this list's order */
+    g_rows[g_nrows++] = (Row){5, R_PADRESET, 0, 0};
+    for (int a = 0; a < input_pad_actions(); a++) g_rows[g_nrows++] = (Row){5, R_PAD, a, 0};
+    g_rows[g_nrows++] = (Row){0, R_PAGE, 6, 0};
+    for (int m = 0; m < (mods_count() ? mods_count() : 1); m++) g_rows[g_nrows++] = (Row){6, R_MOD, m, 0}; /* or none */
 }
 
 static void my_text(uint32_t k, char *t, size_t n) {
@@ -241,6 +276,23 @@ static void my_text(uint32_t k, char *t, size_t n) {
         }
     }
     else if (g_rows[r].kind == R_QUIT) snprintf(t, n, k % 2 ? "Closes the game. Back returns to the main menu." : "YES, QUIT");
+    else if (g_rows[r].kind == R_PADRESET)
+        snprintf(t, n, k % 2 ? "THE GAME'S: as Options > Controller Options sets them, until you change one below. "
+                                 "Select to go back to it."
+                             : input_pad_is_custom() ? "LAYOUT: YOURS" : "LAYOUT: THE GAME'S");
+    else if (g_rows[r].kind == R_MOD) {
+        if (!mods_count())
+            snprintf(t, n, k % 2 ? "Put each mod in its own folder in mods, beside the game folder, at the disc's paths."
+                                 : "NO MODS FOUND");
+        else if (k % 2) snprintf(t, n, "From mods\\%s. Turned on or off from the next start.", mods_name(g_rows[r].i));
+        else {
+            snprintf(t, n, "%s: %s", mods_name(g_rows[r].i), mods_on(g_rows[r].i) ? "ON" : "OFF");
+            for (char *q = t; *q; q++) *q = (char)toupper((unsigned char)*q);
+        }
+    } else if (g_rows[r].kind == R_PAD) {
+        if (k % 2) snprintf(t, n, "Select, then press its controller button (Start cancels). In races; menus keep theirs.");
+        else input_pad_text(g_rows[r].i, t, n);
+    }
     else if (k % 2 == 0) input_binding_text(g_rows[r].menu, g_rows[r].i, t, n);
     else snprintf(t, n, "Select, then press the new key.");
 }
@@ -300,6 +352,9 @@ static void row_chosen(X86Ctx *c) { /* a row's factory (cdecl, no arguments; ecx
         cfg_save(st->key, v);
         if (st->apply) st->apply(v);
     } else if (r >= 0 && g_rows[r].kind == R_KEY) input_capture(g_rows[r].menu, g_rows[r].i);
+    else if (r >= 0 && g_rows[r].kind == R_PAD) input_pad_capture(g_rows[r].i);
+    else if (r >= 0 && g_rows[r].kind == R_PADRESET) input_pad_reset();
+    else if (r >= 0 && g_rows[r].kind == R_MOD) mods_toggle(g_rows[r].i);
     else if (r >= 0 && g_rows[r].kind == R_QUIT) ExitProcess(0); /* as closing the window does */
     else if (r >= 0 && g_rows[r].kind == R_PAGE) s = make_screen(c, g_rows[r].i); /* an achievement: nothing */
     c->eax = s;

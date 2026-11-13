@@ -251,7 +251,25 @@ static uint32_t setting(uint32_t index) {
     }
     case 0x03: return (uint32_t)tz.StandardBias;
     case 0x06: return (uint32_t)tz.DaylightBias;
-    case 0x07: return 1; /* language: English */
+    case 0x07: { /* language (XC_LANGUAGE): the game has 1 English .. 8 Chinese (media\Loc); until one is chosen,
+                  * Windows' display language's (saved, so Recomp Settings shows it; the same in the launcher).
+                  * GAMELANG for scripts, as LANGUAGE is Wine's and Linux's locale list */
+        if (!cfg_saved("language", 0)) {
+            int w = 1;
+            switch (PRIMARYLANGID(GetUserDefaultUILanguage())) {
+            case LANG_JAPANESE: w = 2; break;
+            case LANG_GERMAN: w = 3; break;
+            case LANG_FRENCH: w = 4; break;
+            case LANG_SPANISH: w = 5; break;
+            case LANG_ITALIAN: w = 6; break;
+            case LANG_KOREAN: w = 7; break;
+            case LANG_CHINESE: w = 8; break;
+            }
+            cfg_save("language", w);
+        }
+        int l = cfg_get("GAMELANG", "language", 1);
+        return l >= 1 && l <= 8 ? (uint32_t)l : 1;
+    }
     case 0x08: /* video flags: PAL-60 (0x400000, unused in NTSC), widescreen (0x10000) unless WIDESCREEN=0, and with
                 * VIDEOMODE=720 / 1080 the HDTV modes 480p (0x80000), 720p (0x20000), 1080i (0x40000). XGetVideoFlags
                 * keeps those only on the HDTV AV pack (HalBootSMCVideoMode 1); Forza then picks 1280x720 / 1920x1080 */

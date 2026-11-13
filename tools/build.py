@@ -18,6 +18,7 @@ import ctypes
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -251,6 +252,14 @@ def zig_game():
     print("built build\\forza_recomp.dll")
 
 
+def stamp():
+    """build/built_version.txt: the version this game build is of. The launcher builds again when it is not its own
+    (an update changes the game too, #25)."""
+    v = re.search(r'RECOMP_VERSION "([^"]+)"', open("runtime/version.h").read()).group(1)
+    with open("build/built_version.txt", "w") as f:
+        f.write(v)
+
+
 def main():
     os.chdir(ROOT)
     if "--zig" in sys.argv:
@@ -259,6 +268,7 @@ def main():
         zig_runtime()
         if "--runtime" not in sys.argv:
             zig_game()
+            stamp()
         return
     env = msvc_env()
     if "--launcher" in sys.argv:
@@ -269,6 +279,7 @@ def main():
     runtime(env)
     if "--runtime" not in sys.argv:
         game(env)
+        stamp()
 
 
 if __name__ == "__main__":

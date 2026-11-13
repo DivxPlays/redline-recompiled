@@ -6,8 +6,10 @@
  */
 #include <windows.h>
 #include <setjmp.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 #include "xbox.h"
 
@@ -230,6 +232,21 @@ static LONG track(X86Ctx *c) {
  * the same and carries on. Reads are unlocked on purpose: a stuck thread may be holding the guest lock. */
 static uint32_t g_interrupts[16]; /* connected KINTERRUPTs (interrupts section below) */
 
+/* where every guest thread is: its current function and the game's return addresses on its stack (HITCHLOG's
+ * stalls too) */
+void guest_threads_report(const char *tag) {
+    for (LONG i = 0; i < g_ncontexts && i < 64; i++) {
+        X86Ctx *c = g_contexts[i];
+        if (!c) continue;
+        fprintf(stderr, "[%s] thread %08X in function %08X stack:", tag, M32(c->fs_base + 0x28), c->last_fn);
+        for (uint32_t k = 0, n = 0; k < 1024 && n < 16; k++) {
+            uint32_t v = M32(c->esp + 4 * k);
+            if (v > g_xbe.base + 0x1000 && v < g_xbe.base + g_xbe.image_size) fprintf(stderr, " %08X", v), n++;
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
 static void hang_report(void) {
     for (LONG i = 0; i < g_ncontexts && i < 64; i++) {
         X86Ctx *c = g_contexts[i];
@@ -275,6 +292,7 @@ static void hang_report(void) {
 }
 
 static DWORD WINAPI watchdog_proc(void *p) {
+    thread_name("watchdog");
     ULONGLONG due = p ? GetTickCount64() + 1000ull * (uintptr_t)p : ~0ull;
     for (;;) {
         Sleep(1000);
@@ -327,8 +345,25 @@ typedef struct {
     uint32_t start_routine, start_context, system_routine;
 } ThreadStart;
 
+/* this host thread's name (SetThreadDescription, Windows 10 1607 and later): profilers and HITCHLOG show it */
+void thread_name(const char *fmt, ...) {
+    static HRESULT(WINAPI * set)(HANDLE, PCWSTR);
+    static int init;
+    if (!init) set = (HRESULT(WINAPI *)(HANDLE, PCWSTR))(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetThreadDescription"), init = 1;
+    if (!set) return;
+    char a[64];
+    wchar_t w[64];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(a, sizeof a, fmt, ap);
+    va_end(ap);
+    MultiByteToWideChar(CP_UTF8, 0, a, -1, w, 64);
+    set(GetCurrentThread(), w);
+}
+
 static DWORD WINAPI thread_proc(void *p) {
     ThreadStart *ts = p;
+    thread_name("guest %08X", ts->start_routine);
     X86Ctx *c = &ts->ctx;
     gil_acquire();
     uint32_t target;
@@ -698,6 +733,7 @@ void dpc_kick(void) {
 }
 
 static DWORD WINAPI dpc_proc(void *p) {
+    thread_name("vblank / DPC");
     t_ctx = &g_dpc_ctx;
     g_dpc_tid = GetCurrentThreadId();
     track(&g_dpc_ctx);
@@ -741,8 +777,28 @@ static DWORD WINAPI dpc_proc(void *p) {
         ms = q.QuadPart * 1000.0 / qf.QuadPart;
         if (ms >= next_vblank - 0.05) {
             static double period;
-            if (!period) period = 1000.0 / g_vblank_hz;
+            static int lock = -1; /* VSYNCLOCK=0: the emulated vblank keeps its own clock (testing) */
+            static double aim;    /* VSYNCPHASE=<0..1>: where in the screen's refresh (testing) */
+            if (!period) {
+                period = 1000.0 / g_vblank_hz, lock = !getenv("VSYNCLOCK") || atoi(getenv("VSYNCLOCK"));
+                aim = getenv("VSYNCPHASE") ? atof(getenv("VSYNCPHASE")) : 0.25;
+            }
             next_vblank = (next_vblank && ms - next_vblank < 100 ? next_vblank : ms) + period;
+            /* keep step with the screen when this rate is its refresh rate or a whole fraction of it (60 on 120 Hz):
+             * on its own clock the emulated vblank drifts against the screen's, and wherever the two cross a refresh
+             * shows a frame twice or a frame is never shown. Each vblank moves a tenth of the way to a quarter of a
+             * refresh after the screen's: presents only ever come late, and a windowed one must be in by about 1.5 ms
+             * before the vblank, when the compositor takes it (NOTES.md). A late wake moves it little. */
+            double last, real;
+            if (lock && display_vblank(&last, &real) && ms - last < 1000) {
+                int n = (int)(period / real + 0.5);
+                if (n >= 1 && fabs(n * real - period) < period * 0.01) { /* screens run a little off: 60.27, 143.98 */
+                    double err = fmod(next_vblank - last - real * aim, real);
+                    if (err < 0) err += real;
+                    if (err > real / 2) err -= real;
+                    next_vblank -= err / 10;
+                }
+            }
             forza_vblank();
             nv2a_vblank();
         }

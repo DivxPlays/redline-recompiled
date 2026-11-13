@@ -8,6 +8,8 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
 
 #include "xbox.h"
 
@@ -76,6 +78,121 @@ static int is_partition_root(const char *guest) {
     return !*p || (p[0] == '\\' && !p[1]);
 }
 
+/* ---------------- mods ----------------
+ * <game dir>\..\mods\<mod>\ holds files at the disc's own paths (media\cars\...), each taking the place of the disc's
+ * file. Every folder in mods is a mod, on unless recomp.ini mod_<name> = 0 (Recomp Settings > MODS); by name, the
+ * first mod that has a file wins. Read once at startup, so a change takes effect at the next start. */
+#define MAX_MODS 24
+static char g_mod_name[MAX_MODS][64];
+static int g_nmods = -1;
+typedef struct {
+    char *rel, *host; /* "\media\x.xpr" (as the guest's path after the device), the mod's file */
+    int mod;
+} ModFile;
+static ModFile *g_modfiles;
+static int g_nmodfiles;
+
+static void mod_walk(const char *dir, const char *rel, int mod, int *cap) {
+    char pat[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        char sub[MAX_PATH], subrel[MAX_PATH];
+        snprintf(sub, sizeof sub, "%s\\%s", dir, fd.cFileName);
+        snprintf(subrel, sizeof subrel, "%s\\%s", rel, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) mod_walk(sub, subrel, mod, cap);
+        else {
+            if (g_nmodfiles == *cap) g_modfiles = realloc(g_modfiles, (*cap = *cap ? *cap * 2 : 256) * sizeof *g_modfiles);
+            g_modfiles[g_nmodfiles++] = (ModFile){_strdup(subrel), _strdup(sub), mod};
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static int modfile_cmp(const void *a, const void *b) {
+    const ModFile *x = a, *y = b;
+    int c = _stricmp(x->rel, y->rel);
+    return c ? c : x->mod - y->mod;
+}
+static int name_cmp(const void *a, const void *b) { return _stricmp(a, b); }
+
+static const char *mod_key(int i) { /* mod_<name>, with anything but letters and digits as _ */
+    static char k[80];
+    snprintf(k, sizeof k, "mod_%s", g_mod_name[i]);
+    for (char *p = k + 4; *p; p++)
+        if (!isalnum((unsigned char)*p)) *p = '_';
+    return k;
+}
+
+static void mods_init(void) {
+    if (g_nmods >= 0) return;
+    g_nmods = 0;
+    char dir[MAX_PATH], pat[MAX_PATH];
+    snprintf(dir, sizeof dir, "%s\\..\\mods", guest_path_root());
+    CreateDirectoryA(dir, NULL); /* there to be seen: where mods go */
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != '.' && g_nmods < MAX_MODS &&
+            strlen(fd.cFileName) < sizeof g_mod_name[0])
+            strcpy(g_mod_name[g_nmods++], fd.cFileName);
+    while (FindNextFileA(h, &fd));
+    FindClose(h);
+    qsort(g_mod_name, g_nmods, sizeof g_mod_name[0], name_cmp);
+    int cap = 0;
+    for (int i = 0; i < g_nmods; i++) {
+        int on = cfg_saved(mod_key(i), 1);
+        fprintf(stderr, "[mods] %s: %s\n", g_mod_name[i], on ? "on" : "off");
+        if (!on) continue;
+        char sub[MAX_PATH];
+        snprintf(sub, sizeof sub, "%s\\%s", dir, g_mod_name[i]);
+        mod_walk(sub, "", i, &cap);
+    }
+    qsort(g_modfiles, g_nmodfiles, sizeof *g_modfiles, modfile_cmp);
+    int n = 0; /* one per path: the first mod's */
+    for (int i = 0; i < g_nmodfiles; i++)
+        if (!n || _stricmp(g_modfiles[n - 1].rel, g_modfiles[i].rel)) g_modfiles[n++] = g_modfiles[i];
+    g_nmodfiles = n;
+}
+
+int mods_count(void) { return mods_init(), g_nmods; }
+const char *mods_name(int i) { return i >= 0 && i < mods_count() ? g_mod_name[i] : ""; }
+int mods_on(int i) { return i >= 0 && i < mods_count() && cfg_saved(mod_key(i), 1); } /* as saved: next start */
+void mods_toggle(int i) {
+    if (i >= 0 && i < mods_count()) cfg_save(mod_key(i), !mods_on(i));
+}
+
+/* the mod's file for a path on the disc ("\media\x.xpr"), or NULL */
+static const char *mod_file(const char *rest) {
+    mods_init();
+    if (!g_nmodfiles) return NULL;
+    char key[GPATH];
+    size_t n = 0;
+    for (const char *s = rest; *s && n < sizeof key - 1; s++) /* one backslash between names, none at the end */
+        if (*s != '\\' && *s != '/') key[n++] = *s;
+        else if (n == 0 || key[n - 1] != '\\') key[n++] = '\\';
+    while (n > 1 && key[n - 1] == '\\') n--;
+    key[n] = 0;
+    ModFile k = {key, NULL, 0};
+    int lo = 0, hi = g_nmodfiles - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2, c = _stricmp(g_modfiles[mid].rel, k.rel);
+        if (!c) {
+            static int logged[4096]; /* each path once */
+            if (mid < 4096 && !logged[mid]++) fprintf(stderr, "[mods] %s from %s\n", key, g_mod_name[g_modfiles[mid].mod]);
+            return g_modfiles[mid].host;
+        }
+        if (c < 0) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return NULL;
+}
+
 /* guest object path -> host path; returns 1 for the disc, 2 for the hard disk, 0 if unknown */
 static int host_path(const char *guest, char *out) {
     char p[GPATH * 2];
@@ -93,7 +210,9 @@ static int host_path(const char *guest, char *out) {
     const char *root = guest_path_root();
     int dev;
     if (starts_with_i(p, "\\Device\\CdRom0")) {
-        snprintf(out, MAX_PATH, "%s%s", root, p + strlen("\\Device\\CdRom0"));
+        const char *mod = mod_file(p + strlen("\\Device\\CdRom0"));
+        if (mod) snprintf(out, MAX_PATH, "%s", mod);
+        else snprintf(out, MAX_PATH, "%s%s", root, p + strlen("\\Device\\CdRom0"));
         dev = 1;
     } else if (starts_with_i(p, "\\Device\\Harddisk0\\Partition")) {
         const char *rest = p + strlen("\\Device\\Harddisk0\\Partition");

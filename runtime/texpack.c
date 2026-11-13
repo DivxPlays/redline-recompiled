@@ -148,6 +148,10 @@ static ID3D11ShaderResourceView *load(IWICImagingFactory *wic, const char *path,
 
 static DWORD WINAPI worker(void *arg) {
     (void)arg;
+    thread_name("texture pack loader");
+    /* below the game's own threads: on a PC with few cores, loaders at its priority took it off its core for 60-110 ms
+     * as new scenery came in mid-race (two cores: 63 and 109 ms frames); a replacement shows a little later instead */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
     IWICImagingFactory *wic = NULL;
     if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&wic))) {

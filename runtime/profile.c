@@ -93,6 +93,50 @@ static void sample(HANDLE th, int t) {
     }
 }
 
+/* HITCHLOG's stalls: the host call stack of each thread whose name (thread_name) starts with one of `names` */
+void profile_stacks(const char *const *names, int n) {
+    static HRESULT(WINAPI * get)(HANDLE, PWSTR *);
+    if (!get) get = (HRESULT(WINAPI *)(HANDLE, PWSTR *))(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+    if (!get) return;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te = {.dwSize = sizeof te};
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!th) continue;
+        PWSTR wname = NULL;
+        char tname[64] = "";
+        if (SUCCEEDED(get(th, &wname)) && wname) WideCharToMultiByte(CP_UTF8, 0, wname, -1, tname, sizeof tname, NULL, NULL);
+        if (wname) LocalFree(wname);
+        int want = 0;
+        for (int i = 0; i < n && !want; i++) want = tname[0] && !strncmp(tname, names[i], strlen(names[i]));
+        DWORD64 pcs[24];
+        int depth = 0;
+        if (want && SuspendThread(th) != (DWORD)-1) { /* the walk allocates nothing: the thread may hold the heap lock */
+            CONTEXT ctx = {.ContextFlags = CONTEXT_FULL};
+            if (GetThreadContext(th, &ctx))
+                for (; depth < 24 && ctx.Rip; depth++) {
+                    pcs[depth] = ctx.Rip;
+                    DWORD64 base;
+                    PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+                    if (!f) {
+                        ctx.Rip = *(DWORD64 *)ctx.Rsp, ctx.Rsp += 8;
+                        continue;
+                    }
+                    void *hd;
+                    DWORD64 frame;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, f, &ctx, &hd, &frame, NULL);
+                }
+            ResumeThread(th);
+            fprintf(stderr, "[stall] %s:", tname);
+            for (int d = 0; d < depth; d++) fprintf(stderr, " %s;", name(pcs[d]));
+            fprintf(stderr, "\n");
+        }
+        CloseHandle(th);
+    }
+    CloseHandle(snap);
+}
+
 static ULONGLONG cpu_time(HANDLE th) {
     FILETIME a, b, k, u;
     return GetThreadTimes(th, &a, &b, &k, &u) ? ((ULONGLONG)k.dwHighDateTime << 32 | k.dwLowDateTime) +

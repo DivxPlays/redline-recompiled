@@ -82,6 +82,7 @@ static void read_gamepad(SDL_Gamepad *g, Pad *p) {
 }
 
 static DWORD WINAPI sdl_thread(void *ready) {
+    thread_name("input");
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1"); /* the window belongs to another thread */
     if (!SDL_Init(SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "[input] SDL_Init failed: %s; keyboard only\n", SDL_GetError());
@@ -157,7 +158,7 @@ static uint32_t connected_ports(void) {
 /* ---------------- keyboard ---------------- */
 
 enum { IN_LX_NEG, IN_LX_POS, IN_RX_NEG, IN_RX_POS, IN_LT, IN_RT, IN_A, IN_B, IN_X, IN_Y, IN_BLACK, IN_WHITE,
-       IN_START, IN_BACKBTN, IN_UP, IN_DOWN, IN_LEFT, IN_RIGHT };
+       IN_START, IN_BACKBTN, IN_UP, IN_DOWN, IN_LEFT, IN_RIGHT, IN_RY_NEG, IN_RY_POS };
 typedef struct {
     const char *key, *label;
     int menu, in, def, alt; /* alt: a second key that is not rebindable (arrows beside WASD and the like) */
@@ -192,6 +193,31 @@ static const Binding g_bind[] = {
     {"key_menu_backbutton", "BACK BUTTON", 1, IN_BACKBTN, VK_BACK, 0},
 };
 #define NBIND (int)(sizeof g_bind / sizeof g_bind[0])
+
+/* The driving keys press what the game's controller layout (Options > Controller Options) has for their action, so
+ * E-BRAKE, GEAR UP and the rest do that in every layout; g_bind's are the Default Layout's. The game keeps a record
+ * per controller at 0x51C0D4 + 12 * n {?, layout, vibration}; the keyboard is controller 1. Its 7 layouts, as their
+ * diagrams show them: Default, Shift on Triggers, Accel on Thumbstick, Shift on Thumbstick, Shift on A/B Buttons,
+ * MadCatz Wheel, Speedster Wheel. */
+#define LAYOUT 0x51C0D8u
+static const uint8_t g_layout_bind[] = {0, 1, 4, 5, 6, 8, 9}; /* accelerate, brake, e-brake, gear up, gear down,
+                                                                 * look left, look right */
+static const uint8_t g_layout[7][7] = {
+    {IN_RT, IN_LT, IN_A, IN_B, IN_X, IN_RX_NEG, IN_RX_POS},
+    {IN_A, IN_X, IN_B, IN_RT, IN_LT, IN_RX_NEG, IN_RX_POS},
+    {IN_RT, IN_LT, IN_A, IN_B, IN_X, IN_RX_NEG, IN_RX_POS},
+    {IN_RT, IN_LT, IN_A, IN_RY_POS, IN_RY_NEG, IN_X, IN_B},
+    {IN_RT, IN_LT, IN_X, IN_A, IN_B, IN_RX_NEG, IN_RX_POS},
+    {IN_RT, IN_LT, IN_B, IN_X, IN_A, IN_RX_NEG, IN_RX_POS},
+    {IN_RT, IN_LT, IN_B, IN_A, IN_X, IN_RX_NEG, IN_RX_POS},
+};
+static int driving_in(uint32_t port, int i) { /* g_bind[i]'s action in controller port + 1's layout */
+    uint32_t layout = M32(LAYOUT + 12 * port);
+    for (int k = 0; k < (int)sizeof g_layout_bind && layout < 7; k++)
+        if (g_layout_bind[k] == i) return g_layout[layout][k];
+    return g_bind[i].in;
+}
+
 static int g_key[NBIND]; /* as saved */
 static volatile LONG g_capture = -1; /* binding waiting for its new key */
 static volatile LONG g_rebinds;      /* times a binding changed, for the key prompts (icons.c) */
@@ -290,20 +316,29 @@ static int our_window_focused(void) {
     return pid == GetCurrentProcessId();
 }
 
-static void press(Pad *p, int in) {
+/* an input at strength v (0-255: an analog button's pressure, a stick's tilt) */
+static void put(Pad *p, int in, int v) {
     static const int an[] = {[IN_LT] = AN_LT, [IN_RT] = AN_RT, [IN_A] = AN_A, [IN_B] = AN_B, [IN_X] = AN_X,
                              [IN_Y] = AN_Y, [IN_BLACK] = AN_BLACK, [IN_WHITE] = AN_WHITE};
     static const uint16_t dig[] = {[IN_START] = XB_START, [IN_BACKBTN] = XB_BACK, [IN_UP] = XB_UP, [IN_DOWN] = XB_DOWN,
                                    [IN_LEFT] = XB_LEFT, [IN_RIGHT] = XB_RIGHT};
+    int16_t neg = (int16_t)(-32768 * v / 255), pos = (int16_t)(32767 * v / 255);
+    if (v <= 0) return;
     switch (in) {
-    case IN_LX_NEG: p->thumb[0] = -32768; break;
-    case IN_LX_POS: p->thumb[0] = 32767; break;
-    case IN_RX_NEG: p->thumb[2] = -32768; break;
-    case IN_RX_POS: p->thumb[2] = 32767; break;
-    case IN_START: case IN_BACKBTN: case IN_UP: case IN_DOWN: case IN_LEFT: case IN_RIGHT: p->buttons |= dig[in]; break;
-    default: p->analog[an[in]] = 255;
+    case IN_LX_NEG: p->thumb[0] = neg; break;
+    case IN_LX_POS: p->thumb[0] = pos; break;
+    case IN_RX_NEG: p->thumb[2] = neg; break;
+    case IN_RX_POS: p->thumb[2] = pos; break;
+    case IN_RY_NEG: p->thumb[3] = neg; break;
+    case IN_RY_POS: p->thumb[3] = pos; break;
+    case IN_START: case IN_BACKBTN: case IN_UP: case IN_DOWN: case IN_LEFT: case IN_RIGHT:
+        if (v >= 128) p->buttons |= dig[in];
+        break;
+    default:
+        if (v > p->analog[an[in]]) p->analog[an[in]] = (uint8_t)v;
     }
 }
+static void press(Pad *p, int in) { put(p, in, 255); }
 
 /* INPUTLOG=1: the test keys and the menu/driving switches as they change */
 static int ktrace_input(void) {
@@ -315,6 +350,8 @@ static int ktrace_input(void) {
 /* TESTKEYS=<file>: test scripts hold keys by listing their virtual-key codes in the file, one a line, and the real
  * keyboard is ignored; the game needs no focus then, so a script leaves the desktop to whoever is using it */
 static int g_test2[256]; /* TESTPAD2: keys a script holds for port 1 (vk + 4096 in the file) */
+static int g_testpad0;   /* a pad's buttons a script holds on port 0: 8193 RB, 8194 LB, 8195 R3, 8196 L3, 8197 A,
+                          * 8198 B, 8199 X, 8200 Y, 8201 RT, 8202 LT, 8203 Start */
 static int test_keys(int down[256]) {
     static const char *path;
     static int init, last[256];
@@ -332,9 +369,12 @@ static int test_keys(int down[256]) {
         text[got] = 0;
         int now[256] = {0}, vk, used;
         memset(g_test2, 0, sizeof g_test2);
+        int pad0 = 0;
         for (const char *t = text; sscanf(t, "%d%n", &vk, &used) == 1; t += used)
             if (vk > 0 && vk < 256) now[vk] = 1;
             else if (vk > 4096 && vk < 4096 + 256) g_test2[vk - 4096] = 1;
+            else if (vk > 8192 && vk <= 8203) pad0 |= 1 << (vk - 8193);
+        g_testpad0 = pad0;
         if (memcmp(now, last, sizeof now) && ktrace_input()) {
             fprintf(stderr, "[input] test keys:");
             for (int k = 0; k < 256; k++)
@@ -346,6 +386,8 @@ static int test_keys(int down[256]) {
     memcpy(down, last, sizeof last);
     return 1;
 }
+
+static volatile LONG g_pad_capture; /* CONTROLLER BUTTONS, below */
 
 /* the keyboard's part of port 0 */
 static void read_keyboard(Pad *p) {
@@ -378,17 +420,216 @@ static void read_keyboard(Pad *p) {
         if (g_bind[i].menu != menu) continue;
         int k = g_key[i], a = g_bind[i].alt;
         if ((k && down[k] && !g_stale[k]) || (a && down[a] && !g_stale[a])) {
-            press(p, g_bind[i].in);
+            InterlockedExchange(&g_pad_capture, -1); /* the keyboard gives up a wait for a controller button */
+            press(p, menu ? g_bind[i].in : driving_in(0, i));
             InterlockedExchange(&g_last_device, DEV_KEYBOARD);
         }
     }
 }
 
+/* SHIFT ON SHOULDERS, in a race: RB and LB (the Xbox's Black and White) press what the controller's layout has for gear
+ * up and down; the camera and HUD they were move to the right and left stick clicks */
+static int g_shoulders = -1;
+void input_set_shoulders(int on) { g_shoulders = on; }
+static void shoulder_shift(uint32_t port, Pad *p) {
+    int up = p->analog[AN_BLACK], down = p->analog[AN_WHITE];
+    p->analog[AN_BLACK] = p->buttons & XB_RTHUMB ? 255 : 0, p->analog[AN_WHITE] = p->buttons & XB_LTHUMB ? 255 : 0;
+    p->buttons &= ~(XB_RTHUMB | XB_LTHUMB);
+    if (up) press(p, driving_in(port, 5));   /* g_bind: gear up */
+    if (down) press(p, driving_in(port, 6)); /* gear down */
+}
+
+static int shoulders_on(void) {
+    if (g_shoulders < 0 && (g_shoulders = cfg_get("SHOULDERS", "shoulders", 0)))
+        fprintf(stderr, "[input] shift on shoulders\n");
+    return g_shoulders;
+}
+
+/* CONTROLLER BUTTONS (Recomp Settings): a controller's buttons for the racing actions. Until one is changed, buttons
+ * reach the game by position, and its Controller Options layout (and SHIFT ON SHOULDERS) decide what they do. Once
+ * one is (recomp.ini pad_custom = 1 and pad_<action> = a source below, -1 none, all saved together), in a race each
+ * action's button presses what that controller's layout has for the action, so the choice holds in every layout. The
+ * face buttons, shoulders, triggers and stick clicks then do only what they are bound to; the d-pad, Back and the
+ * right stick's axes keep their own job unless bound. Menus always get the buttons by position. */
+enum { S_A, S_B, S_X, S_Y, S_RB, S_LB, S_RT, S_LT, S_R3, S_L3, S_RS_UP, S_RS_DOWN, S_RS_LEFT, S_RS_RIGHT, S_UP, S_DOWN,
+       S_LEFT, S_RIGHT, S_BACK, NSRC, S_START = 31 /* cancels a capture; never bound */ };
+static const char *const g_src_xbox[NSRC] = {"A", "B", "X", "Y", "RB", "LB", "RT", "LT", "RS CLICK", "LS CLICK", "RS UP",
+                                             "RS DOWN", "RS LEFT", "RS RIGHT", "D-PAD UP", "D-PAD DOWN", "D-PAD LEFT",
+                                             "D-PAD RIGHT", "BACK"};
+static const char *const g_src_ps[S_L3 + 1] = {"CROSS", "CIRCLE", "SQUARE", "TRIANGLE", "R1", "L1", "R2", "L2", "R3", "L3"};
+static const int g_src_an[S_R3] = {AN_A, AN_B, AN_X, AN_Y, AN_BLACK, AN_WHITE, AN_RT, AN_LT};
+static const uint16_t g_src_bit[NSRC] = {[S_R3] = XB_RTHUMB, [S_L3] = XB_LTHUMB, [S_UP] = XB_UP, [S_DOWN] = XB_DOWN,
+                                         [S_LEFT] = XB_LEFT, [S_RIGHT] = XB_RIGHT, [S_BACK] = XB_BACK};
+static const uint8_t g_act[] = {0, 1, 4, 5, 6, 7, 8, 9, 10, 11}; /* g_bind's driving actions a button can do */
+#define NACT (int)sizeof g_act
+static int g_pad[NACT];                  /* each action's source, as saved */
+static int g_pad_custom = -1;            /* the bindings above apply (else the game's layout) */
+static volatile LONG g_pad_capture = -1; /* the action waiting for its button */
+static volatile LONG g_pad_serial;       /* captures begun */
+static ULONGLONG g_pad_until;            /* when the wait gives up */
+static uint32_t g_pad_mute[4];           /* sources held when a capture began or ended: unseen until released */
+
+static int src_value(const Pad *p, int s) { /* 0-255 */
+    int t;
+    switch (s) {
+    case S_RS_UP: t = p->thumb[3]; break;
+    case S_RS_DOWN: t = -p->thumb[3]; break;
+    case S_RS_LEFT: t = -p->thumb[2]; break;
+    case S_RS_RIGHT: t = p->thumb[2]; break;
+    case S_START: return p->buttons & XB_START ? 255 : 0;
+    default: return s < S_R3 ? p->analog[g_src_an[s]] : p->buttons & g_src_bit[s] ? 255 : 0;
+    }
+    return t <= 0 ? 0 : t >= 32767 ? 255 : t * 255 / 32767;
+}
+
+static void src_clear(Pad *p, int s) {
+    if (s < S_R3) p->analog[g_src_an[s]] = 0;
+    else if (s == S_RS_UP || s == S_RS_DOWN) p->thumb[3] = 0;
+    else if (s == S_RS_LEFT || s == S_RS_RIGHT) p->thumb[2] = 0;
+    else if (s == S_START) p->buttons &= ~XB_START;
+    else p->buttons &= ~g_src_bit[s];
+}
+
+static uint32_t src_held(const Pad *p) {
+    uint32_t m = src_value(p, S_START) ? 1u << S_START : 0;
+    for (int s = 0; s < NSRC; s++)
+        if (src_value(p, s) > 160) m |= 1u << s;
+    return m;
+}
+
+static const char *pad_key(int a) { /* "pad_" and the keyboard binding's name: pad_gear_up */
+    static char k[NACT][40];
+    snprintf(k[a], sizeof k[a], "pad_%s", g_bind[g_act[a]].key + 4);
+    return k[a];
+}
+
+static int pad_custom(void) {
+    if (g_pad_custom < 0) {
+        for (int a = 0; a < NACT; a++) {
+            g_pad[a] = cfg_saved(pad_key(a), -1);
+            if (g_pad[a] >= NSRC) g_pad[a] = -1;
+        }
+        g_pad_custom = cfg_saved("pad_custom", 0) == 1;
+    }
+    return g_pad_custom;
+}
+
+/* the button controller 1's layout (with SHIFT ON SHOULDERS) has action a on: what the page shows until one changes */
+static int layout_source(int a) {
+    int i = g_act[a];
+    if (shoulders_on() && (i == 5 || i == 6 || i == 10 || i == 11))
+        return i == 5 ? S_RB : i == 6 ? S_LB : i == 10 ? S_R3 : S_L3;
+    switch (driving_in(0, i)) {
+    case IN_A: return S_A;
+    case IN_B: return S_B;
+    case IN_X: return S_X;
+    case IN_Y: return S_Y;
+    case IN_BLACK: return S_RB;
+    case IN_WHITE: return S_LB;
+    case IN_RT: return S_RT;
+    case IN_LT: return S_LT;
+    case IN_RX_NEG: return S_RS_LEFT;
+    case IN_RX_POS: return S_RS_RIGHT;
+    case IN_RY_POS: return S_RS_UP;
+    case IN_RY_NEG: return S_RS_DOWN;
+    }
+    return -1;
+}
+
+int input_pad_actions(void) { return NACT; }
+int input_pad_is_custom(void) { return pad_custom(); }
+
+/* "GEAR UP: RB", by the names of the pad last used, or the prompt while it waits */
+void input_pad_text(int a, char *t, size_t n) {
+    if (a < 0 || a >= NACT) {
+        t[0] = 0;
+        return;
+    }
+    int s = pad_custom() ? g_pad[a] : layout_source(a);
+    const char *name = g_pad_capture == a                         ? "?"
+                       : s < 0                                     ? "NONE"
+                       : g_last_device == DEV_PLAYSTATION && s <= S_L3 ? g_src_ps[s]
+                                                                      : g_src_xbox[s];
+    snprintf(t, n, "%s: %s", g_bind[g_act[a]].label, name);
+}
+
+void input_pad_capture(int a) {
+    pad_custom();
+    g_pad_until = GetTickCount64() + 5000;
+    InterlockedIncrement(&g_pad_serial);
+    InterlockedExchange(&g_pad_capture, a);
+}
+
+void input_pad_reset(void) {
+    pad_custom();
+    cfg_save("pad_custom", 0), g_pad_custom = 0;
+}
+
+/* while a capture waits, a press on any controller (not held when it began) becomes the action's button; the game
+ * sees nothing of the controllers meanwhile. Start, or 5 s, gives up. */
+static void pad_capture(uint32_t port, Pad *p) {
+    static LONG seen[4];
+    uint32_t held = src_held(p);
+    g_pad_mute[port] &= held;
+    int a = g_pad_capture;
+    if (a < 0) return;
+    if (seen[port] != g_pad_serial) seen[port] = g_pad_serial, g_pad_mute[port] |= held;
+    uint32_t fresh = held & ~g_pad_mute[port];
+    if (fresh >> S_START & 1 || GetTickCount64() > g_pad_until) InterlockedExchange(&g_pad_capture, -1);
+    else if (fresh) {
+        int s = 0;
+        while (!(fresh >> s & 1)) s++;
+        if (!pad_custom())
+            for (int k = 0; k < NACT; k++) g_pad[k] = layout_source(k); /* from what was in use */
+        for (int k = 0; k < NACT; k++)
+            if (g_pad[k] == s) g_pad[k] = -1; /* a button does one thing: the action it had loses it */
+        g_pad[a] = s;
+        for (int k = 0; k < NACT; k++) cfg_save(pad_key(k), g_pad[k]);
+        cfg_save("pad_custom", 1), g_pad_custom = 1;
+        fprintf(stderr, "[input] %s on %s\n", g_bind[g_act[a]].label, g_src_xbox[s]);
+        InterlockedExchange(&g_pad_capture, -1);
+    }
+    g_pad_mute[port] |= held;
+    memset(p, 0, sizeof *p);
+}
+
+/* in a race with the player's buttons: each action from its button, through the controller's layout */
+static void pad_actions(uint32_t port, Pad *p) {
+    Pad raw = *p;
+    uint32_t bound = 0;
+    for (int a = 0; a < NACT; a++)
+        if (g_pad[a] >= 0) bound |= 1u << g_pad[a];
+    for (int s = 0; s < NSRC; s++)
+        if (s <= S_L3 || bound >> s & 1) src_clear(p, s);
+    for (int a = 0; a < NACT; a++)
+        if (g_pad[a] >= 0) put(p, driving_in(port, g_act[a]), src_value(&raw, g_pad[a]));
+}
+
 static void read_pad(uint32_t port, Pad *p) {
     AcquireSRWLockShared(&g_lock);
-    if (g_slot[port].pad) *p = g_slot[port].state;
+    int pad = g_slot[port].pad != NULL;
+    if (pad) *p = g_slot[port].state;
     else memset(p, 0, sizeof *p);
     ReleaseSRWLockShared(&g_lock);
+    static int testing = -1;
+    if (testing < 0) testing = getenv("TESTKEYS") != NULL;
+    if (port == 0 && testing) { /* testing: a pad's buttons held by a script (TESTKEYS), over a real one's or none */
+        static const int an[] = {AN_BLACK, AN_WHITE, -1, -1, AN_A, AN_B, AN_X, AN_Y, AN_RT, AN_LT};
+        for (int b = 0; b < 10; b++)
+            if (g_testpad0 >> b & 1 && an[b] >= 0) p->analog[an[b]] = 255;
+        p->buttons |= (g_testpad0 & 4 ? XB_RTHUMB : 0) | (g_testpad0 & 8 ? XB_LTHUMB : 0) |
+                      (g_testpad0 & 1024 ? XB_START : 0);
+        pad = 1;
+    }
+    if (pad) {
+        pad_capture(port, p);
+        for (int s = 0; s < 32; s++)
+            if ((s < NSRC || s == S_START) && g_pad_mute[port] >> s & 1) src_clear(p, s);
+        if (forza_racing()) {
+            if (pad_custom()) pad_actions(port, p);
+            else if (shoulders_on()) shoulder_shift(port, p);
+        }
+    }
     if (port == 0) read_keyboard(p);
     if (port == 1 && !g_slot[1].pad && getenv("TESTPAD2")) { /* a script's second player: Enter/Space A, Esc B, arrows,
                                                                  * Tab Start, W/S triggers, A/D steer */
@@ -470,8 +711,10 @@ void hle_XInputGetState(X86Ctx *c) {
     read_pad(port, &p);
     if (memcmp(&p, &g_last[port], sizeof p)) {
         if (ktrace_input())
-            fprintf(stderr, "[input] port %d packet %u: buttons %04X A %u B %u\n", port, g_packet[port] + 1, p.buttons,
-                    p.analog[AN_A], p.analog[AN_B]);
+            fprintf(stderr, "[input] port %d packet %u: buttons %04X A %u B %u X %u Y %u black %u white %u LT %u RT %u "
+                    "RS %d,%d\n", port, g_packet[port] + 1, p.buttons, p.analog[AN_A], p.analog[AN_B], p.analog[AN_X],
+                    p.analog[AN_Y], p.analog[AN_BLACK], p.analog[AN_WHITE], p.analog[AN_LT], p.analog[AN_RT], p.thumb[2],
+                    p.thumb[3]);
         g_last[port] = p, g_packet[port]++;
     }
     M32(s) = g_packet[port];
@@ -480,6 +723,9 @@ void hle_XInputGetState(X86Ctx *c) {
     memcpy(g_mem + s + 14, p.thumb, 8);
     ret(c, ERROR_SUCCESS, 2);
 }
+
+static int g_rumble = -1; /* RUMBLE STRENGTH: percent of the game's motor speeds */
+void input_set_rumble(int percent) { g_rumble = percent; }
 
 /* XInputSetState(hDevice, pFeedback): XINPUT_FEEDBACK_HEADER (dwStatus, hEvent, 58 reserved) then Rumble.
  * Handed to the SDL thread and completed at once; ERROR_IO_PENDING is what a queued request returns. */
@@ -490,8 +736,12 @@ void hle_XInputSetState(X86Ctx *c) {
         ret(c, ERROR_DEVICE_NOT_CONNECTED_, 2);
         return;
     }
+    if (g_rumble < 0) g_rumble = cfg_get("RUMBLE", "rumble", 100);
+    uint16_t lo = (uint16_t)(M16(f + 0x42) * g_rumble / 100), hi = (uint16_t)(M16(f + 0x44) * g_rumble / 100);
     AcquireSRWLockExclusive(&g_lock);
-    g_slot[port].rumble[0] = M16(f + 0x42), g_slot[port].rumble[1] = M16(f + 0x44);
+    if (ktrace_input() && (lo != g_slot[port].rumble[0] || hi != g_slot[port].rumble[1]))
+        fprintf(stderr, "[input] port %d rumble %u %u (the game's %u %u)\n", port, lo, hi, M16(f + 0x42), M16(f + 0x44));
+    g_slot[port].rumble[0] = lo, g_slot[port].rumble[1] = hi;
     ReleaseSRWLockExclusive(&g_lock);
     M32(f) = ERROR_SUCCESS;
     if (M32(f + 4)) M32(M32(f + 4) + 4) = 1; /* signal hEvent (handle = KEVENT) */

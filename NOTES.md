@@ -140,6 +140,9 @@ histogram (`nv2a_report`).
 - SEH/C++ exception unwinding has no runtime support yet.
 
 ### Release checklist (0.1, as of 2026-11-04)
+**At the next release (the owner, 2026-11-12, "not right now"):** the owner chooses a README design and a trailer
+design before they are made: show the choices (/kit:design; Repo Trailers' `trailer.py styles redline` previews each
+trailer style from the footage), and build the release's README and its new trailer in the ones picked.
 Works: boot, intro, title, profiles, main menu, Arcade and Free Run races (Maple Valley, Silverstone, Tsukuba),
 showroom, assists, Recomp Settings, pause/quit, videos, sound, saves.
 - **Rendered cube maps** (found by the track sweep): the table of cube maps the game renders (car reflections) had 8
@@ -433,6 +436,16 @@ Not for 0.1: Xbox Live (never), System Link, DES.
 - **Achievement pop-up like the Xbox 360's**, in Redline Recompiled's style: the 360 toast's shape and motion (a
   rounded bar sliding in, the icon in a circle on the left, "Achievement unlocked" over the name), our colours and
   emblem, and an unlock sound of our own (made for the port, not the 360's). Today: render.c achieve_toast.
+  **Done 2026-11-12** (not released): achieve_toast draws it with a pixel shader over one GDI texture (the emblem in
+  the circle's place, "Achievement unlocked" and the name beside it): at the bottom middle, a red ring pops up (0.25 s,
+  a little past full size), a dark pill opens out of it (0.2-0.55 s), the text fades in; from 4.3 s backwards; 5 s
+  each, one at a time; as wide as the text, 1/12 of the screen's height. The sound, after the owner turned down a
+  synthesized chime and 130 CC0 sounds from Kenney's packs: the game's own FanFare (media\Audio\UISounds.xwb, entry
+  31, Xbox ADPCM 44.1 kHz stereo), read from the player's disc at the first pop-up (audio.c chime_make; nothing of
+  the game ships): its first 3.5 s, faded out over the last 0.8 s, x0.55 (-6 dBFS peak), mixed into the front pair.
+  Checked: a 20 s recording has it at every pop-up (correlation 1.0 with the approved cut). The wave bank format (v3:
+  regions, 24-byte entries, 64-byte names) is read in audio.c; ACHTEST=n earns achievement n in the test file
+  (build\achievements_test), for trying it.
 - **Players get errors building the game** (reported by many). Collect their launcher logs and fix the causes;
   the next item would remove most of them.
 - **Simpler requirements, like other recomps:** no Visual Studio build tools or Python to play; those only for
@@ -484,12 +497,40 @@ Not for 0.1: Xbox Live (never), System Link, DES.
      Python not yet run (the DLSS and FSR files were copied in for the tests, to download nothing but the three
      approved tools). Visual Studio stays the development build (python tools/build.py).
 - **A how-to for making the texture pack** (tools/texextract.py, tools/texpack.py, Real-ESRGAN; and the videos).
+  **The textures, done another way (2026-11-12, not released): Make 4x textures in the launcher** (the owner asked for
+  it). Ready page, while build\textures\redline4x has no aliases.txt (texpack.py writes it last, once whole): a page
+  saying what it does (time, ~12 GB, Vulkan, ~67 MB of tools), then a job like Build's (g_job 1, pack_thread): free
+  space (12 GB, 2 when picking up), fetch_tools and then g_pack_tools through the same fetch() (pinned SHA-256:
+  Real-ESRGAN ncnn v0.2.5.0's zip, which publishes none, checked against the copy this port's pack was made with;
+  numpy 2.5.4 and Pillow 12.3.0, the versions the owner's own Python made the pack with, into the build's Python
+  folder as capstone is), python tools\texextract.py <game> build\textures\dump, tools\texpack.py. Its bar is weighted
+  2 / 8 / 90 and moved by "progress: a/b unit" lines the tools print, which run() keeps out of the log and shows as
+  "320 of 902 files" (texpack.py streams Real-ESRGAN's -v "done" lines, so it moves inside a batch of 400). Cancel
+  ends the job's process tree; both tools skip what they did, so "Carry on" picks up; texpack.py writes each texture
+  under .tmp and renames it (a Cancel while writing had left nothing half-written by luck) and clears .tmp files at its
+  start. A failure stays on the Ready page: its last log line in amber, "4x textures: try again", the details;
+  texpack.py ends a Real-ESRGAN failure with a sentence about Vulkan as the last line. texextract.py builds its hash
+  DLL with zig when the build's zig is there (players have no Visual Studio; same keys as MSVC's). A tool whose
+  checked file is gone is fetched again (not only by its .ok). Checked in a test copy under build\ (the dump and pack
+  hard-linked, aliases.txt / nopack.txt copied, zig by a junction, the launcher driven by posted keys and pictured with
+  PrintWindow): the real downloads, 30 textures made to the end (the button gone), 445 with a Cancel at 92% and
+  "Carry on" to the end, a hidden Real-ESRGAN failing as above. Not checked: a whole run from nothing (~90 minutes
+  here), another vendor's GPU, a PC without Vulkan. The videos (vidpack.py) stay on the command line.
 - From GitHub (DivxPlays/redline-recompiled, read 2026-11-08 and 2026-11-10; issues #1-3, #5-19, PR #4, none
   answered yet; the 0.2.0 alpha release commit closed #1, #2, #5, #6 and #8-#18, and left #3 open for its hitches and
   buttons):
   - **#19 "can't change language"** (opened 2026-11-10, no text): Xbox games take their language from the
     console's settings (XGetLanguage); not checked yet what the port answers. Find what kernel.c returns for it and
     add a Language choice to Recomp Settings and the launcher; ask the reporter which language they wanted.
+    **Fixed 2026-11-12** (not released): kernel.c answered setting 7 (XC_LANGUAGE) with 1, English. The game has
+    eight, by the Xbox's numbers (its table at 0x52C7B0: 1 EN, 2 JA, 3 DE, 4 FR, 5 ES, 6 IT, 7 KO, 8 ZH, folders
+    media\Loc, Fonts and FrontEnd; no Portuguese, though Redump's name for the disc lists Pt). Setting 7 is now the
+    `language` setting (recomp.ini; GAMELANG for scripts, as LANGUAGE is Wine's and Linux's locale list), a row in
+    Recomp Settings (English names) and the launcher (each language's own name), at the next start. Checked: French,
+    Japanese, Korean and Chinese menus; the row steps through all eight in the game and the launcher. Not checked: a
+    race or the career in another language.
+    Until one is chosen, the launcher (at its start) and kernel.c (at the game's) save Windows' display language's
+    number (GetUserDefaultUILanguage; English if the game lacks it). Checked only on an English Windows (it saves 1).
   - **#20 the update checker never sees pre-releases** (found 2026-11-10 after 0.2.0): launcher.cpp asks for
     /releases/latest, which skips pre-releases, and every alpha is one. Ask for /releases?per_page=1 instead; and
     publish the next version as a full release (0.2.0 launchers read only /releases/latest). 0.2.0 alpha itself
@@ -542,6 +583,86 @@ Not for 0.1: Xbox Live (never), System Link, DES.
       its start to every seek. Tested on made-up images (an XISO; a full-disc one at 0x18300000, which the old code
       failed with the player's message; junk: "This .iso is not an Xbox disc image") and on the owner's XISO
       (identical to game\, Forza.xbe's SHA-1 right). Not tried on a real full-disc dump of Forza.
+  - **#24 "Square Shadow Under Car"** (markmepage-ui, 2026-11-12, on 0.2.2): night tracks (Tokyo, Pacific Shipyards;
+    not Sunset Peninsula), texture pack on or off; the owner also saw the road's light wrong on Tokyo. Already in
+    0.1.0's sweep. At night a race lights its road through a 640x480 light buffer (one of the three screen targets,
+    drawn first each frame): cleared to 0x3F3F3F, the road pieces, the car's flattened silhouette multiplied in
+    (stencil NOTEQUAL 1 / REPLACE, so once), each road piece again with the headlights added (ONE/ONE: a 128x128x8 DXT5
+    volume, PROJECT3D, all three axes clamped to a black border; texcoords from the car's frame: s lateral x0.1+0.5,
+    t forward x-0.025+0.9, r height x0.25+0.25), then a 2.5 x 4.5 m quad under the car multiplying 1 - 0.875 x a soft
+    32x64 L8 blob. The road samples it (16 draws; none also samples the shadow map). Daytime tracks draw the same
+    buffer with the sun's shadow map in it, and the same blob (0.81).
+    The headlights' road pieces wholly outside the beam (s 1.5-2.8) added full white: render.c's sampler cache keyed
+    on address mode and filter only, so the volume got the sampler of an earlier texture with a light border. The
+    right of the road and its barrier came out white with a straight edge, and the blob next to it read as a dark box.
+    **Fixed 2026-11-12** (not released): the border colour is in the sampler's key. Tokyo's grid: an evenly dim road,
+    the beam ahead, a soft contact shadow behind the bumper. Pacific Shipyards is locked in the test profile, so not
+    seen. The dark patch under the car plus the sun's shadow by day is the game's own pair (the owner called it a
+    double shadow on Laguna Seca): unchanged.
+    Tools from it: a frame dump (build/dump.now) now starts with the state it inherits ("s <method> <value>" lines);
+    build/targets.now saves every colour target once (as SCREENSHOT); build/hotlap.ps1 counts tracks from the list's
+    start (the list starts at the track chosen last and does not wrap) and checks Tokyo's name (build/tokyo_list.png).
+  - **#25 "Version mismatch (label)"** (2026-11-12): the launcher says 0.2.3, the game's corner 0.2.1. Cause: the
+    launcher's built() only checks that build\forza_recomp.dll exists, so after a new version is unzipped over an old
+    one it offers Play and runs the old build (only Rebuild makes a new one). 0.2.2 and 0.2.3 changed only the launcher
+    and version.h, so nothing was missed yet, but the next release changes the game itself (#19, #24, the pop-up,
+    Shift on Shoulders): players who update would get none of it. Fix before that release: remember the version the
+    game was built with and offer Build again when it differs.
+    **Fixed 2026-11-12** (not released): build.py writes build\built_version.txt (version.h's RECOMP_VERSION) after a
+    whole build, and the launcher offers Play only when it is its own version; otherwise the home page says "Update
+    your build" and its button (Update) runs the build again (the disc and tools kept). Checked: no stamp gave that
+    page; Update built in 29 s here and Play came back.
+  - **#26 "Mitsubishi Lancer VIII thumbnail not showing in garage"** (2026-11-12): the 2004 Lancer Evolution VIII
+    FQ-330 (B1, so upgraded or won) in the Free Run garage's car bar: its slot a grey box with a black band down its
+    right fifth, no car. The comment about the white, shiny logo is the car's own chrome badge: not a fault.
+    How icons work: media\CarIcons1-5.xpr are 128x4096 DXT5 strips of 64 slots of 128x64, one per car (231; strip 1
+    slot 56 is a solid yellow placeholder on the disc). The game copies them to the profile (T:\CarIcons*.xpr and
+    CarIcons.sig) and, for every car the player owns, draws the car into a 128x64 target (with a 128x64 depth),
+    locks it to read it back, compresses it into slots 0, 1, 2... of strip 1 and saves it ("Updating Thumbnail Icon",
+    with the SaveLoadHandler save, f_00390820). The FQ-330 shows fine in Buy Cars (its disc icon).
+    Cause, reproduced by making the icon's target 160x240 at its creation (as a bigger surface at the same address
+    earlier leaves it: targets only grow): D3D refuses a draw whose colour and depth targets differ in size, so the
+    car never drew on the cleared grey; and render_readback_ squeezed all of the target into the 128 columns read
+    (grey in the left 80%, the rest black: the player's picture at 160 wide). **Fixed 2026-11-12** (not released):
+    a colour target bigger than the surface drawn, with its depth exactly the surface's size, is made that size again
+    in its slot, its corner (the background drawn so far) copied over; and a read back takes the last surface drawn
+    into the target (sw x sh, its top-left corner), which also keeps the anti-aliased screen's 2:1 squeeze. Checked:
+    the same test now saves the car's icon; a bought car's icon at 1080i/2x/DLSS/ultrawide and 480p/2x/FSR 1; a race
+    at 1080i unchanged, with no target made again in normal play (the screens' 1920 colour with the 3840-wide AA
+    depth, the game's own mismatch, is left alone: growing those to match shrank the race into a corner). An icon
+    saved broken stays so until the game draws that car again: repainting it does (Garage > Customize Paint: the
+    Acura's slot 0 was drawn again, brown). Not checked: the player's own profile and situation (what put a bigger
+    surface at that address first).
+  - **#28 "Various visual bugs"** (tfundeca, 2026-11-12, on 0.2.3; six screenshots), three things:
+    1) In a race, the HUD's car status box (tyres and damage, right of the lap times) shows a grey box with part of a
+       car's side view where its drivetrain diagram belongs (engine, steering wheel, axles: what it shows here).
+       Mechanism found, not the player's exact case: a target the game reads back (a car's icon, a paint job) hands
+       its memory back to the game, which reuses it for new textures; texture_target still answered with the old
+       host target at that address, so a texture there showed the old picture (an icon: a car on grey). Seen here:
+       after a repaint, a race's load put a 421x8 LIN_A8R8G8B8 texture where the icon's target (009B1000) had been.
+       **Fixed 2026-11-12** (not released): a read back records the hash of the guest memory it wrote (mem_hash);
+       until the target is drawn into or cleared again, texture_target compares it once a frame when the target is
+       sampled, and once the game has written something else there, textures read that ("[render] target ...: the
+       game wrote over it since it was read back"). Also seen: the race's quarter-size glare source (480x270, read
+       back at each start) is written over before its next draw: one frame each. Races and menus look the same.
+    2) Tokyo: barriers and buildings glowing white. That is #24, fixed (not released).
+    3) A car painted in Customize Paint loses its shine and gets grey patches (a red Mustang Cobra R in My Cars).
+       Reproduced: after painting, the Acura's grille and badge surround turned paint-coloured grey. How a paint job
+       is made: the game clears a 1024x1024 target to 00FFFFFF and draws one quad that reads that same target (t0)
+       and the livery as an 8-bit indexed image (t1, LIN 0x1B, the index in alpha) looked up in a 256x1 palette with
+       the new paint (t2, texture mode 15 DEPENDENT_AR: t2 = tex2(t1.a, t1.r)), r0 = t2 over t0 by t2.a; then a 512
+       copy of it and a 512 dirt layer the same way, each read back and compressed. Two gaps made all three blank
+       (white, alpha 0), so painted cars lost every detail printed on them: shaders.c had no DEPENDENT_AR / _GB
+       (t2 = 0), and a draw reading its own target got an empty unit. **Fixed 2026-11-12** (not released): mode 15/16
+       sample the stage's texture at the stage before's (a, r) / (g, b); a colour target read by its own draw is read
+       from a copy (target_copy). (A first try that read the guest memory of a target not drawn yet was wrong: the
+       game clears it first, and that memory held heap leftovers: camouflage in the paint shop's preview.) Checked:
+       the three layers now hold the car's lights, badges, lettering and interior (and the dirt); the paint shop,
+       My Cars and the new icon show the painted Acura with its dark grille. Not compared side by side: the shine
+       itself. A car painted before keeps its blank layers until painted again. READBACKDUMP=1 saves each target
+       read back as build/rb_<address>.bmp.
+  - **#27 "Steering wheel not working"** (2026-11-12, a Fanatec CSWB V2; the owner answered that wheels are planned):
+    input is XInput only (hle_xinput.c), so DirectInput wheels are not seen. On the roadmap: "Steering wheels" below.
   - **C1002, compiler out of heap in pass 2** (#2, #3, #8, #16; Visual Studio 2026 and Build Tools 2022, 16 GB RAM,
     16 CPUs): recomp/funcs_039.c's f_002E5DC0, f_002E6930, f_002E74E0, f_002E8050 (~4,000 lines each), then D8040.
     **Fixed 2026-11-10** (not released): measured alone, funcs_039.c took 65.4 GB of commit to compile (it built here
@@ -554,6 +675,16 @@ Not for 0.1: Xbox Live (never), System Link, DES.
     change (20 s recorded) sounded right to the owner (2026-11-10).
   - **#1: "does not build"** after ~2 hours, extra installs, "several different image files": the launcher takes
     only Forza Motorsport (USA) (Rev 1) (SHA-1 check). Say plainly which disc is needed, and why another fails.
+    **Fixed 2026-11-12** (not released): the launcher reads Forza.xbe and default.xbe off an .iso itself
+    (launcher.cpp iso_top_files: the XDVDFS volume where xiso_extract.py looks, the top folder's tree) and checks them
+    (source_check / disc_check) when the disc is chosen (and at the start), saying it under the path, and again first
+    thing in Build, before the tools' 95 MB and the 3.6 GB unpack (an ISO unpacked before is checked in game\, as the
+    image may be gone). A folder is checked the same way. The headline says what it is, from the XBE certificate:
+    another release of Forza (its version; USA Rev 1's Forza.xbe is 70), another game (its title, from default.xbe),
+    the right version with other bytes (damaged or modified), or no Xbox image. Not the region: Rev 1's Forza.xbe is
+    marked for every region (7), so editions cannot be named by it. Tested on made-up XISOs and a made-up full-disc
+    image (each case at choosing; Build with a wrong one, and with the right one, which went on to the unpack and step
+    4); not on a real disc of another edition.
   - **Hitches** (#3, build\redline.log, RX 6600): 5,027 ms at CPreEventOverlay (96 shaders compiled, 353 textures
     decoded in one frame: first run, nothing cached), 2,329 ms SelectCarView, 3,000 / 2,017 / 1,884 / 1,233 ms unnamed,
     1,200 ms CUIPlayerProfile, 1,083 ms CUIOptionsMenu twice with no shaders or textures (CPU-side), 635 ms
@@ -581,10 +712,69 @@ Not for 0.1: Xbox Live (never), System Link, DES.
   - **Controls vs the game's diagram** (#3): Controller Options with "Shift on A/B Buttons" shows X e-brake, A gear
     up, B gear down; the port's table (hle_xinput.c g_bind) has A e-brake, B up, X down, and the keyboard's E/Q send
     B/X. Check in the game which pad buttons shift under each Controller Options layout; match it or document it.
+    **Fixed 2026-11-12** (not released): pads were right all along (read_gamepad passes buttons by position, and the
+    game applies its own layout); the keyboard's driving keys pressed the Default Layout's buttons whatever the
+    layout. The game has 7 layouts (Default, Shift on Triggers, Accel on Thumbstick, Shift on Thumbstick, Shift on A/B
+    Buttons, MadCatz Wheel, Speedster Wheel) and keeps a record per controller at 0x51C0D4 + 12 * n {?, layout,
+    vibration} (found by RAM dumps across layouts; the game indexes it so at 0x723AE). hle_xinput.c driving_in() now
+    presses each driving key's action as controller 1's layout has it, from its diagrams (g_layout), the right
+    stick's up / down too (Shift on Thumbstick). Checked in a race with manual shifting: E/Q shift 1-2-3-2 with Shift
+    on A/B Buttons and with Shift on Thumbstick. Not checked: the wheel layouts and Shift on Triggers in a race.
   - **Pad buttons cannot be rebound** (#3): Recomp Settings rebinds keyboard keys only; asked for rebinding driving
     actions on a pad, or shifting on the shoulders (Black/White).
+    **Shifting on the shoulders done 2026-11-12** (not released): Recomp Settings SHIFT ON SHOULDERS (recomp.ini
+    shoulders; SHOULDERS for scripts), in a race only (forza_racing): a pad's RB / LB (the Xbox's Black / White)
+    press what that controller's layout has for gear up / down (driving_in, by port), and camera / HUD move to the
+    right / left stick clicks. Checked in a race on the Default layout with a script-held RB / LB (TESTKEYS 8193-8196:
+    RB, LB, R3, L3 on port 0, over a real pad's): 1-2-3-2, the guest seeing B and X. Full pad rebinding: still to do.
+    Seen while testing: on Shift on Thumbstick, loaded from the profile with an Xbox Series X pad connected, neither
+    the keyboard's E nor the shoulder's right-stick-up shifted, though the keyboard's had in an earlier session (the
+    layout set in Controller Options, maybe no pad then). **Not reproduced (2026-11-12)**, so not a fault of the input
+    code: with the pad connected, E shifted 1-2-3-2 on Shift on Thumbstick both set in Controller Options and loaded
+    from the profile after a restart (record 0's layout, 0x51C0D8, read 3 at the main menu; the game finds a player's
+    record by its index at player+0x314, f_000723A0). The likely cause of that run: Free Run's transmission had come
+    back as Automatic (it did here after the restart, though set to Manual before it), where nothing shifts.
+    Controller Options' Save writes the profile at once (UserProfile.xml: the four 12-byte records {?, layout,
+    vibration} from 0x504, controller 1's layout at 0x508); the assists' transmission is saved only by a later save
+    (a race's end), so a test that kills the game keeps the layout and loses Manual. A test that changes either puts
+    the profile back (scratchpad backup) afterwards.
+    **Full pad rebinding done 2026-11-12** (not released): Recomp Settings > CONTROLLER BUTTONS (hle_xinput.c; the
+    page after MENU KEYS), ten racing actions (accelerate, brake, e-brake, gears, look back / left / right, camera,
+    HUD), choose a row and press a button on any controller. Until one is changed it shows and does what controller
+    1's layout has (with SHIFT ON SHOULDERS); the first change saves all ten (recomp.ini pad_custom = 1,
+    pad_<action> = source: 0-9 A B X Y RB LB RT LT RS-click LS-click, 10-13 right stick up / down / left / right,
+    14-18 d-pad up / down / left / right, Back; -1 none). In a race (forza_racing) each action's source then presses
+    what that controller's layout has for the action (driving_in, as the keyboard does, analog values kept: a trigger
+    on a face button's pressure), so the choice holds in every layout; the face buttons, shoulders, triggers and
+    stick clicks do only what is bound, the d-pad, Back and right stick axes keep their job unless bound; SHIFT ON
+    SHOULDERS is then ignored. A button bound to a second action leaves the first. The capture: the game sees nothing
+    of the pads while it waits; buttons held when it starts or ends count only once released (the menu calls the
+    row's factory a moment after A); Start, 5 s or any keyboard key gives up. Menus keep buttons by position. The
+    LAYOUT row goes back to the game's (pad_custom = 0). Names follow the pad last used (CROSS, R1... on a
+    PlayStation pad; not checked, none here). Labels over ~20 characters wrap, and the menu does not redraw a row's
+    description while it is selected. Checked with script-held pad buttons (TESTKEYS 8193-8203 now RB LB R3 L3 A B
+    X Y RT LT Start; port 0 counts as a pad in test mode): GEAR UP -> RB, GEAR DOWN -> LB took camera and HUD off
+    them; in an Arcade race on the Default layout RB gave the game B, LB X, B and X nothing, A A; Start cancels;
+    LAYOUT back to the game's made RB the camera again. Then on Shift on Triggers (Controller Options, saved; the
+    profile put back after): the page started from that layout (accelerate A, brake X, e-brake B, gear up RT, gear
+    down LT), GEAR UP -> RB, and in a race RB gave the game RT, RT nothing, A A, X X. Not checked: a real pad
+    (INPUTLOG now also prints the right stick). Controller Options' controller 1 screen opens on its layout row
+    (rows: vibration, layout, d-pad), left / right change it, A saves.
+  - **RUMBLE STRENGTH** (2026-11-12, not released; recomp.ini rumble, RUMBLE: 100 / 75 / 50 / 25, both settings
+    lists, at once): hle_XInputSetState scales the game's two motor speeds by it. INPUTLOG logs each change with the
+    game's own values; a race at 50 gave exactly half (0 5734 for 0 11468...).
+  - **ACHIEVEMENT SOUND** (2026-11-12, not released): Recomp Settings ON/OFF (recomp.ini achsound), read at each
+    pop-up (audio.c audio_chime). Checked: off, a 20 s recording of four pop-ups has no fanfare (best match 0.44).
+  - **The launcher's Settings in two tabs** (2026-11-12, not released): its page held 13 rows, so the four newest
+    settings were in the game only. Now Picture (11: scale, upscaling, frame rate, filter, fullscreen, widescreen,
+    ultrawide, video mode, texture pack, videos, texture dump) and Game & sound (6: language, button prompts, shift on
+    shoulders, achievement sound, enhanced audio, speakers): every row of the game's Recomp Settings (Setting.tab).
+    LB / RB on a pad, Tab on the keyboard, switch them. Checked: both tabs, Tab, a click on Shift on shoulders writes
+    shoulders=1 and back. Not with a real pad's LB / RB (the same handler as Tab).
   - **Kernel settings 0x11 and 0xA read as 0** at startup (kernel.c "[k] setting ... reads as 0"): check what the
-    game reads them for.
+    game reads them for. **Nothing to do (2026-11-12):** they are the EEPROM's XC_P_CONTROL_GAMES (0xA, the
+    parental rating for games: 0 = all allowed) and XC_MISC (0x11, flags: auto power-down, no daylight saving: 0 =
+    neither), so 0 is the right answer for both, as on a console with no parental lock.
   - **#5 "Game won't install"** (PsxMicha, Windows 11, opened 2026-11-08): find_functions.py stops with
     FileNotFoundError on analysis\Forza.functions.json, i.e. the analysis folder is not there. **#9** is the same.
     **Fixed 2026-11-10** (not released): choosing the ISO with the launcher's file dialog made the ISO's folder the
@@ -631,7 +821,8 @@ Not for 0.1: Xbox Live (never), System Link, DES.
     checker (#11), "What's new" once after an update (#12), works with a controller alone (#13), a "Report this
     crash" button (#14).
   - **Mouse steering / camera** (#7, from Stilwater): if added, drive the game's own steering or camera update from
-    the mouse's movement, not the stick (a stick's dead zone and acceleration make it feel like one).
+    the mouse's movement, not the stick (a stick's dead zone and acceleration make it feel like one). The camera:
+    on the roadmap ("Mouse camera look", below).
 - From Reddit (r/decomps 1xp5sxc, 33K views, 26 comments; r/recomps 1xp61gv; read from the owner's PDFs
   2026-11-08, a few comments cut at page breaks):
   - **The build tools** (moesengott_, Turbulent-Pomelo8480, MaleficentBasket): "The Visual Studio C++ build tools
@@ -645,6 +836,54 @@ Not for 0.1: Xbox Live (never), System Link, DES.
     xRevive is another, closed-source PC version of Forza Motorsport; its save format would have to be studied
     (a player's own save files only).
   - **Micro-stutter in races**: the owner replied he'd fix it in the next update; with the hitches above.
+    Measured 2026-11-12 (scratchpad pace_aff.ps1: pace.ps1, an Arcade race at the owner's settings with FPSLOG, and
+    -Mask to hold redline.exe to fewer cores; this PC a Ryzen 7 9800X3D, 8 cores). 8 cores: 144 new frames a
+    second, the worst gap under 13 ms after the countdown's (~300 ms, the texture pack's planned wait and ~120
+    decodes). 2 cores: 63 and 109 ms frames mid-race as scenery came in, with 8 and 29 replacements loading, and new
+    frames down to ~124 a second: the pack's loaders (half the PC's cores, 2-8, whatever the affinity) and the shader
+    workers (cores - 2) ran at the game's priority. **Changed** (not released): both run below normal (as video.c's
+    decoder already did). After, 2 cores: the pack-time hitch gone; 56 and 68 ms ones with no loads in them remain
+    (the game's own work; not found). 4 cores: one 34-46 ms frame either way. One run each, so a direction, not a
+    measurement. The ~2,000 "decoded" a second in a race are the ~32 1x1 colour textures the game rewrites each
+    frame, updated in place (cheap).
+    **The rest, looked into (2026-11-12)** with new tools: HITCHLOG=1 adds, after each [hitch] line, every thread's
+    CPU ms in the gap (QueryThreadCycleTime; threads named by thread_name: guest <start>, gpu (push buffer),
+    vblank / DPC, texture pack loader, shader compiler, audio, input, window...), and a stall watcher that, when a
+    race goes 35 ms without a new frame, prints each guest thread's function and stack, the GPU's push buffer and
+    flip queue (nv2a_brief) and the host stacks of the gpu, texture pack and shader threads (profile_stacks).
+    Found, two cores: the 55-68 ms frames had the CPU mostly idle (~20 of 110 core-ms), so waits, not shortage; in
+    every stall the game's main thread waits for push buffer room (D3D_MakeRequestedSpace -> D3D_BlockOnTime) with
+    the GPU's commands waiting and no flip stall, and the GPU thread was at a different place each time: hashing
+    textures, uploading vertices, waiting for the GPU lock while the vblank thread presented, waiting for a pack
+    replacement (the countdown's planned wait), or in the D3D driver; the pack loaders were idle each time (no
+    priority inversion). At 60 frames a second on two cores, driving is smooth (worst 17-18 ms) but for one 46-67 ms
+    frame at each camera change (pace.ps1 presses V every 4 s; presenting time up those windows; no DLSS re-create),
+    which 4 and 8 cores show none of. So: no single cause left; two cores at 144 is more work than they can do.
+    Not done: making a camera change cheaper. Frame pacing against the display (the port presents at the emulated
+    vblank, sync interval 0: on a fixed 144 Hz screen without G-Sync/FreeSync, 60 a second shows 2 and 3 refreshes
+    in turn, a judder however smooth the game runs): FRAME RATE AUTO and pacing against the screen, below.
+    **FRAME RATE AUTO** (2026-11-12, not released; the new default, value 0): the primary screen's refresh rate
+    (EnumDisplaySettings; 59 -> 60, 143 -> 144 and the like, halved past 165, at least 60), resolved in forza_init
+    (forza_fps(); hle_bink.c asks it too, so the track previews keep their own 29.97). Checked: 144 here, a race at
+    144 new frames a second (worst gap 7.8-10 ms), the previews at 2997/100. Auto reads the screen the window opens
+    on (render_screen), not the primary.
+    **Pacing against the screen** (2026-11-12, not released). FPSLOG now says what the screen made of the presents
+    (GetFrameStatistics: "refreshes repeated", a refresh that showed the last present again, and "presents
+    dropped", one replaced before any refresh showed it) and where in the screen's refresh each present came
+    ("phase", eighths after its vblank). Measured windowed on the 144 Hz screen at the main menu: presents at 75-87%
+    of the refresh (about 1-1.7 ms before the vblank, when the compositor takes its frame) miss it half the time, ~16
+    repeat/drop pairs a second; anywhere else about one pair in 20 s. On its own clock the emulated vblank drifted
+    through the refresh (here one cycle in ~6 minutes: the screen measures 143.98 Hz), so for ~45 s of each cycle the
+    picture stuttered that way; how often depends on the screen. Now: a "display vblank" thread waits for the
+    screen's vblanks (IDXGIOutput::WaitForVBlank on the output the window is on, followed when it moves, any
+    adapter's) and keeps the last one's time and the refresh period; when the frame rate is the refresh rate or a
+    whole fraction of it (within 1%: this PC's 60 Hz screen runs at 60.27), dpc_proc moves each emulated vblank a
+    tenth of the way to a quarter of a refresh after the screen's. A quarter, as presents only ever come late: far
+    from the compositor's edge, and borderless fullscreen (checked on the 60 Hz screen) showed no edge at all, even
+    at 85-100%. Checked: windowed 144 Hz, menu 2 pairs a minute, a race like before without the bursts; fullscreen
+    60 Hz (FRAMERATE=60) none; Auto on the 240 Hz screen 120 locked to every second refresh, none in 24 s. The game's
+    clock counts vblanks, so it now runs at the screen's real rate (0.45% fast on a 60.27 Hz screen). VSYNCLOCK=0 turns
+    it off, VSYNCPHASE=<0-1> moves the aim (testing). Not checked: a G-Sync / FreeSync screen in its variable mode.
   - Not to act on: wishes (more threads, a graphics overhaul, more tracks, DLSS 5, path tracing, "do FM8 next"),
     comparisons with xRevive and Relive, AI criticism.
 - **Linux / Steam Deck support** (requested 2026-11-08). First step: run the Windows build under Proton/Wine (the
@@ -660,6 +899,18 @@ Not for 0.1: Xbox Live (never), System Link, DES.
   build time; a mod DLL that registers its own replacements or hooks at load (as Zelda64Recomp's mods do) needs a
   small API and a stable list of hookable functions. Mods are made and shared by players (their own files; nothing
   of the game ships with ours).
+  **Step 1 done 2026-11-12** (not released): file.c host_path gives a disc path the file of the first mod (by
+  folder name) that has it, from <game>\..\mods\<mod>\<the disc's path>; every folder there is a mod (a name
+  starting with "." is skipped, at most 24), on unless recomp.ini mod_<name> = 0, which Recomp Settings > MODS (after
+  CONTROLLER BUTTONS) switches. The folders and their files are read once at startup into a sorted list (no file
+  system look per open); the log names each mod and each path a mod serves ([mods]). The game makes the mods folder
+  (gitignored; never in the zip, which is git archive). Only whole files: the menus' pictures are inside the
+  archives in media\cabs, so changing one means rebuilding its archive (texture packs replace single textures
+  instead); car folders, event pictures, fonts and the start-up screens are loose files. A mod adding a file the
+  disc lacks is opened by name but not listed in a directory search. Checked: a mod putting the team splash in
+  place of FrontEnd\EN\DisclaimerScrn.xpr showed it at start (the disclaimer's text without it); MODS turned it off
+  (mod_test=0) and the next start left it out. Not checked: a car or track mod, files the game copies to the hard
+  disk's cache (the installer compares times, so a mod's file should be copied again).
 - **HDR** (requested 2026-11-08). The game draws in 8-bit SDR, so HDR means expanding its picture: an HDR10 swap
   chain (R10G10B10A2, ST.2084) or scRGB (FP16) when Windows reports an HDR display (IDXGIOutput6), the final
   shrink/upscale pass mapping SDR to HDR (paper white for the HUD and menus, a peak brightness, highlights such as
@@ -700,6 +951,38 @@ Not for 0.1: Xbox Live (never), System Link, DES.
   3) a Recomp Setting for menus: 16:9 (now) / filled.
   Check every screen kind (main menu, lists, showroom, garage, dialogs over a race, loading screens, Bink movies)
   at 21:9 (ULTRAWIDE=233) and 32:9 (356), and that 16:9 does not change.
+  **1) and 3) done 2026-11-12** (not released): render.c menu_sides, MENU SIDES (menusides, MENUSIDES; FILLED by
+  default, BLACK as before; in both settings lists). In present(), with ULTRAWIDE, on a frame with no 3D across a wide
+  target for the last 8 presents (ui_squeeze marks g_wide3d_frame when a depth-tested draw goes to one: the
+  showroom, the grid, a race and its pause menu keep their own sides) and not the race view: the middle 16:9 is
+  shrunk to an eighth and blurred there (9 x 5 taps), and each side gets the middle's edge mirrored outwards and
+  stretched (its outer edge shows 1/16 of the way in; at 1/6 the menus' titles and text came out as streaks), one tap
+  a pixel, 0.6 to 0.2 as bright outwards, blended by MAX so the full-width bars, rules and black bands the game
+  draws stay. Checked at 32:9 (Profile Select, main menu, achievements, Arcade's event list; the grid untouched)
+  and 21:9 (main menu); 16:9 never runs it. Then at 32:9: the start-up splashes and the intro movie (a soft glow
+  either side), Select Car Class, the loading screen (filled); Select Car and its Assists dialog keep black sides
+  (3D car). Not checked: the garage, dialogs over a race. 2) (moving the menus' edges to the screen's) not done.
+- **Steering wheels** (#27, a Fanatec CSWB V2; the owner, 2026-11-12: on the roadmap "for future addition"). Input
+  is XInput only (hle_xinput.c), and most wheels are DirectInput devices, so the game never sees them. SDL3 is
+  already linked and reads them (SDL_Joystick: axes, buttons, force feedback through SDL_Haptic). Steps: 1) a wheel
+  as controller 1: steering on the left stick's X, the pedals on the triggers (separate or combined axes), its
+  buttons on the pad's, so every layout of the game's Controller Options works; 2) a Recomp Settings page to bind
+  axes and buttons, with ranges and dead zones (pedals differ by make and are often inverted), kept per device;
+  3) force feedback from the game's own vibration (XInputSetState's motors) or better, from the car's steering
+  forces, if the game exposes them; 4) the game's own MadCatz and Speedster wheel layouts for their steering
+  ratio. Check with a real wheel (none here): ask a player with one to try a test build.
+- **Mouse camera look** (the owner, 2026-11-12: on the roadmap "for the future"). In a race the right stick looks
+  around and the keyboard has Z / X / C (look left, right, back); the mouse does nothing. Steps: 1) find what the
+  right stick drives: the race camera's look angles in each view (two chase, bumper, hood), following the stick's
+  value with MEMWATCH to where the camera reads it (every camera goes through 0x1DA620); 2) move those angles from
+  the mouse directly, not through the stick: a stick's dead zone and response curve make a mouse feel like a stick
+  (#7: Saints Row ignored the first 30% of tilt in Stilwater); only if the angles cannot be reached, a mouse-as-stick
+  driver like Stilwater's mouse_look, starting past Forza's measured dead zone; 3) when the mouse rests, the view
+  eases back to the front as letting go of the stick does (check what the stick does), or stays (a setting);
+  4) the mouse is captured (hidden, raw input, so high-DPI mice count in their own units) only while driving
+  (forza_racing) and released in menus, the pause menu and when the window loses focus; 5) settings in Recomp
+  Settings and the launcher: Mouse look on/off, sensitivity, invert up/down. Check every view, replays, 16:9 and
+  ultrawide, Alt+Tab and the pause menu letting the cursor go.
 - **Nothing of 0.2 goes to GitHub until the owner says it is ready to release.**
 
 ### Next steps

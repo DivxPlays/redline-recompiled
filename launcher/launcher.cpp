@@ -9,6 +9,9 @@
  *   once:      python tools\find_functions.py, tools\oovpa_pp.py, tools\find_symbols.py (analysis\)
  *   always:    python tools\lift.py (recomp\), python tools\build.py --zig (build\redline.exe, the runtime, and
  *              build\forza_recomp.dll, the game code it loads)
+ * Make 4x textures (Ready page, once built) runs the same way: its tools (g_pack_tools: Real-ESRGAN, numpy, Pillow),
+ * python tools\texextract.py (every texture on the disc into build\textures\dump) and tools\texpack.py (each
+ * upscaled 4x into build\textures\redline4x), whose "progress: a/b" lines move its bar.
  * Nothing needs installing: the tools run from build\tools. launcher.ini next to it remembers the game. Everything is
  * relative to the launcher's own folder, the root of the port.
  *
@@ -61,10 +64,11 @@
  * here and unpacked under build\tools: nothing is installed. capstone is the one package the Python tools need (the
  * same version as the port was made with, so the lifted code is the same); zig is clang, lld and mingw-w64's headers,
  * building with Windows' own C runtime (tools/build.py --zig). */
-static const struct {
+typedef struct {
     const char *what, *url, *sha256, *dir, *check; /* check: a file the unpacked tool has */
     int mb;
-} g_tools[] = {
+} Tool;
+static const Tool g_tools[] = {
     {"Python 3.12.10 (embeddable)", "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip",
      "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3", "build\\tools\\python-3.12.10",
      "build\\tools\\python-3.12.10\\python.exe", 11},
@@ -78,6 +82,27 @@ static const struct {
      "build\\tools\\zig-0.14.1\\zig-x86_64-windows-0.14.1\\zig.exe", 82},
 };
 #define PYTHON "build\\tools\\python-3.12.10\\python.exe" /* run() starts commands in the root */
+/* Make 4x textures' tools, fetched the same way the first time: Real-ESRGAN (ncnn, Vulkan: any recent graphics card)
+ * and the two packages tools/texextract.py and texpack.py need beside the build's Python, at the versions the port's
+ * own pack was made with */
+static const Tool g_pack_tools[] = {
+    {"Real-ESRGAN (the upscaler)",
+     "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip",
+     "abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d", "build\\realesrgan",
+     "build\\realesrgan\\realesrgan-ncnn-vulkan.exe", 46},
+    {"numpy 2.5.4",
+     "https://files.pythonhosted.org/packages/12/33/fefe62073dc8acfd0f2b9ed7c003af2f50aa61555e113e6db02b8f79f145/"
+     "numpy-2.5.4-cp312-cp312-win_amd64.whl",
+     "a7b1b6353e36a7e50de2973a38d705c88ee93adcf120673cee7f45a4a3fa223a", "build\\tools\\python-3.12.10",
+     "build\\tools\\python-3.12.10\\numpy\\__init__.py", 13},
+    {"Pillow 12.3.0",
+     "https://files.pythonhosted.org/packages/45/89/da2f7971a317f83d807fdd4065c0af40208e59e692cc43d315a71a0e96d1/"
+     "pillow-12.3.0-cp312-cp312-win_amd64.whl",
+     "a2b55dd6b2a4c4b7d87ffa56bdb33fdc5fdb9a462173861a7bc097f17d91cb09", "build\\tools\\python-3.12.10",
+     "build\\tools\\python-3.12.10\\PIL\\__init__.py", 8},
+};
+#define PACK_DIR "build\\textures\\redline4x" /* tools/texpack.py's; its aliases.txt is written last, once it is whole */
+#define PACK_GB 12                           /* the dump 1.5 GB and the pack 9.7 GB, and room to spare */
 
 static HWND g_wnd, g_log;
 static char g_root[MAX_PATH], g_ini[MAX_PATH], g_rini[MAX_PATH], g_source[MAX_PATH];
@@ -90,6 +115,13 @@ static const char *const g_step_names[] = {"Getting the build tools", "Extractin
                                            "Checking the game's files", "Finding the game's code",
                                            "Translating it to C", "Compiling"};
 #define STEPS 6
+static int g_job; /* what is running (or ran last): 0 the build, 1 Make 4x textures */
+static const char *const g_pack_step_names[] = {"Getting the texture tools", "Reading every texture on the disc",
+                                                "Upscaling them 4x"};
+static const int g_pack_weight[] = {2, 8, 90}; /* percent of the whole: the upscaling is nearly all of it */
+#define PACK_STEPS 3
+static volatile LONG g_sub_done, g_sub_total; /* the step's own progress ("progress: a/b" lines); total 0: none */
+static int g_pack_failed;                     /* the last Make 4x textures stopped (g_fail_line says why) */
 
 /* ---------------- the build ---------------- */
 
@@ -102,9 +134,11 @@ static void post_log(const char *fmt, ...) {
     PostMessageA(g_wnd, WM_LOG, 0, (LPARAM)_strdup(buf));
 }
 
+static void set_detail(const char *s);
 static void step(int n) {
+    InterlockedExchange(&g_sub_total, 0);
     InterlockedExchange(&g_step, n);
-    PostMessageA(g_wnd, WM_STEP, 0, 0);
+    set_detail(""); /* not the last step's "900 of 902 files" */
 }
 
 /* what the step is doing now, under its name in the build card ("zig 0.14.1, 34 of 82 MB"); the build thread writes
@@ -323,10 +357,17 @@ static char *whats_new(void) {
 }
 static char *g_news; /* shown on page 2 the first start after an update */
 
-static int built(void) { /* the game code: the runtime (build\redline.exe) can come built, without it */
+static int built_once(void) { /* a game build, of any version */
     char dll[MAX_PATH];
     snprintf(dll, sizeof dll, "%s\\build\\forza_recomp.dll", g_root);
     return exists(dll) && g_source[0];
+}
+static int built(void) { /* a game build of this version (build.py's stamp): an update changes the game too (#25) */
+    char path[MAX_PATH], v[32] = "";
+    snprintf(path, sizeof path, "%s\\build\\built_version.txt", g_root);
+    FILE *f = built_once() ? fopen(path, "rb") : NULL;
+    if (f) fgets(v, sizeof v, f), fclose(f);
+    return !strcmp(v, RECOMP_VERSION);
 }
 
 /* run cmd (through cmd.exe) in the root folder, its output to the log; returns its exit code */
@@ -362,16 +403,35 @@ static DWORD run(const char *cmd) {
     ResumeThread(pi.hThread);
     g_child = job;
     CloseHandle(wr);
-    char buf[1024], out[2100];
+    char buf[1024], out[2100], prog[64];
     DWORD n;
+    int bol = 1, skip = 0; /* at a line's start; in a "progress: a/b unit" line, which goes to the bar, not the log */
+    size_t pn = 0;
     while (ReadFile(rd, buf, sizeof buf - 1, &n, NULL) && n) { /* bare \n to \r\n for the edit control */
         size_t k = 0;
         for (DWORD i = 0; i < n; i++) {
+            if (bol) skip = n - i >= 10 ? !memcmp(buf + i, "progress: ", 10) : 0, pn = 0;
+            bol = buf[i] == '\n';
+            if (skip) {
+                if (!bol && pn < sizeof prog - 1) prog[pn++] = buf[i];
+                if (bol) { /* a whole one: the step's progress and what it counts */
+                    unsigned a, b;
+                    char unit[24] = "";
+                    prog[pn] = 0;
+                    if (sscanf(prog, "progress: %u/%u %23s", &a, &b, unit) >= 2 && b) {
+                        char d[96];
+                        InterlockedExchange(&g_sub_done, (LONG)a), InterlockedExchange(&g_sub_total, (LONG)b);
+                        snprintf(d, sizeof d, "%u of %u %s", a, b, unit);
+                        set_detail(d);
+                    }
+                }
+                continue;
+            }
             if (buf[i] == '\n' && (i == 0 || buf[i - 1] != '\r')) out[k++] = '\r';
             out[k++] = buf[i];
         }
         out[k] = 0;
-        PostMessageA(g_wnd, WM_LOG, 0, (LPARAM)_strdup(out));
+        if (k) PostMessageA(g_wnd, WM_LOG, 0, (LPARAM)_strdup(out));
     }
     CloseHandle(rd);
     WaitForSingleObject(pi.hProcess, INFINITE);
@@ -474,37 +534,37 @@ static int saved_copy(const char *url, const char *sha256, char *out) {
     return 0;
 }
 
-/* g_tools, each fetched once: download, check, unpack with Windows' tar. A tool counts as there by its .ok file,
+/* a list of tools (g_tools, g_pack_tools), each fetched once: download, check, unpack with Windows' tar. A tool counts as there by its .ok file,
  * written only once it unpacked whole (Cancel during the unpacking leaves its files but no .ok, so the next Build
  * fetches it again) */
-static int fetch_tools(void) {
+static int fetch(const Tool *list, size_t count) {
     char check[MAX_PATH], ok[MAX_PATH + 4], dir[MAX_PATH], zip[MAX_PATH], tar[MAX_PATH], hex[65], cmd[MAX_PATH * 3];
     ExpandEnvironmentStringsA("%SystemRoot%\\System32\\tar.exe", tar, MAX_PATH); /* not a tar from Git, which cannot unzip */
-    for (size_t i = 0; i < sizeof g_tools / sizeof g_tools[0]; i++) {
-        snprintf(check, sizeof check, "%s\\%s", g_root, g_tools[i].check);
+    for (size_t i = 0; i < count; i++) {
+        snprintf(check, sizeof check, "%s\\%s", g_root, list[i].check);
         snprintf(ok, sizeof ok, "%s.ok", check);
-        if (exists(ok)) continue;
+        if (exists(ok) && exists(check)) continue; /* a tool whose file went is fetched again */
         if (strlen(g_root) > 120) { /* zig's deepest file is 114 characters below build\tools\zig-0.14.1 */
             post_log("This folder's path is too long for the build tools (%u characters, 120 at most). Move the port to a "
-                     "shorter one, such as C:\\Games\\RedlineRecompiled, then press Build again.\r\n", (unsigned)strlen(g_root));
+                     "shorter one, such as C:\\Games\\RedlineRecompiled, then try again.\r\n", (unsigned)strlen(g_root));
             return 0;
         }
-        snprintf(dir, sizeof dir, "%s\\%s", g_root, g_tools[i].dir);
+        snprintf(dir, sizeof dir, "%s\\%s", g_root, list[i].dir);
         SHCreateDirectoryExA(NULL, dir, NULL);
-        int saved = saved_copy(g_tools[i].url, g_tools[i].sha256, zip);
-        if (saved) post_log("Using %s from %s\r\n", g_tools[i].what, zip);
+        int saved = saved_copy(list[i].url, list[i].sha256, zip);
+        if (saved) post_log("Using %s from %s\r\n", list[i].what, zip);
         else {
             snprintf(zip, sizeof zip, "%s\\download.zip", dir);
-            post_log("Downloading %s, %d MB: %s\r\n", g_tools[i].what, g_tools[i].mb, g_tools[i].url);
+            post_log("Downloading %s, %d MB: %s\r\n", list[i].what, list[i].mb, list[i].url);
             DownloadProgress progress;
-            progress.what = g_tools[i].what;
-            HRESULT hr = URLDownloadToFileA(NULL, g_tools[i].url, zip, 0, &progress);
+            progress.what = list[i].what;
+            HRESULT hr = URLDownloadToFileA(NULL, list[i].url, zip, 0, &progress);
             if (FAILED(hr) && !g_cancel) {
                 post_log("Windows' download failed (error %08lX), so trying with curl.\r\n", hr);
-                set_detail(g_tools[i].what);
+                set_detail(list[i].what);
                 DeleteFileA(zip);
-                curl_cmd(cmd, sizeof cmd, zip, g_tools[i].url);
-                Watch watch = {g_tools[i].what, zip, g_tools[i].mb, 1};
+                curl_cmd(cmd, sizeof cmd, zip, list[i].url);
+                Watch watch = {list[i].what, zip, list[i].mb, 1};
                 HANDLE t = CreateThread(NULL, 0, watch_size, &watch, 0, NULL);
                 if (run(cmd) == 0) hr = S_OK;
                 watch.on = 0;
@@ -518,15 +578,15 @@ static int fetch_tools(void) {
             if (FAILED(hr)) {
                 DeleteFileA(zip);
                 post_log("The download failed with curl too. If the internet works in your browser, download this file "
-                         "there and leave it in your Downloads folder:\r\n%s\r\n", g_tools[i].url);
-                post_log("Download %s in your browser (the link is in the details), then press Build again.\r\n",
-                         strrchr(g_tools[i].url, '/') + 1);
+                         "there and leave it in your Downloads folder:\r\n%s\r\n", list[i].url);
+                post_log("Download %s in your browser (the link is in the details), then try again.\r\n",
+                         strrchr(list[i].url, '/') + 1);
                 return 0;
             }
-            if (!hash_file(zip, BCRYPT_SHA256_ALGORITHM, 32, hex) || strcmp(hex, g_tools[i].sha256)) {
+            if (!hash_file(zip, BCRYPT_SHA256_ALGORITHM, 32, hex) || strcmp(hex, list[i].sha256)) {
                 DeleteFileA(zip);
                 post_log("%s did not match its checksum, so it was not used (a broken download, or not the file it "
-                         "should be). Press Build to try again.\r\n", g_tools[i].what);
+                         "should be). Try again.\r\n", list[i].what);
                 return 0;
             }
         }
@@ -536,12 +596,18 @@ static int fetch_tools(void) {
         set_detail("");
         if (!saved) DeleteFileA(zip); /* the player's own copy stays theirs */
         if (code || !exists(check)) {
-            if (!g_cancel) post_log("Unpacking %s failed.\r\n", g_tools[i].what);
+            if (!g_cancel) post_log("Unpacking %s failed.\r\n", list[i].what);
             return 0;
         }
         FILE *mark = fopen(ok, "w");
         if (mark) fclose(mark);
     }
+    return 1;
+}
+
+static int fetch_tools(void) {
+    char check[MAX_PATH];
+    if (!fetch(g_tools, sizeof g_tools / sizeof g_tools[0])) return 0;
     /* the embeddable Python finds modules only where its ._pth says: its own folder (capstone) and tools\ */
     snprintf(check, sizeof check, "%s\\build\\tools\\python-3.12.10\\python312._pth", g_root);
     FILE *f = fopen(check, "w");
@@ -552,32 +618,168 @@ static int fetch_tools(void) {
     return 1;
 }
 
+/* an XBE's title and version, from its certificate; 0 if it is not one. Not its region: the USA Rev 1 Forza.xbe is
+ * marked for every region (7), so editions cannot be told apart by it */
+static int xbe_title(const char *path, char title[128], unsigned *version) {
+    unsigned char h[0x1000];
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    size_t n = fread(h, 1, sizeof h, f);
+    fclose(f);
+    unsigned cert = n >= 0x11C ? *(unsigned *)(h + 0x118) - *(unsigned *)(h + 0x104) : 0;
+    if (memcmp(h, "XBEH", 4) || cert + 0xB0 > n) return 0;
+    wchar_t w[41];
+    memcpy(w, h + cert + 0xC, 80), w[40] = 0;
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, title, 128, NULL, NULL);
+    *version = *(unsigned *)(h + cert + 0xAC);
+    return 1;
+}
+
+/* the folder holds the disc this port was made for (its Forza.xbe, by SHA-1): 1; else 0, with what it holds instead
+ * (detail, maybe empty) and a one-line headline */
+static int disc_check(const char *dir, char *detail, size_t dn, char *head, size_t hn) {
+    char xbe[MAX_PATH], hex[41], title[128];
+    unsigned version, want = 70; /* Forza Motorsport (USA) (Rev 1)'s Forza.xbe */
+    detail[0] = 0;
+    snprintf(xbe, sizeof xbe, "%s\\Forza.xbe", dir);
+    if (sha1_file(xbe, hex) && !strcmp(hex, XBE_SHA1)) {
+        snprintf(head, hn, "\xE2\x9C\x93 the right disc");
+        return 1;
+    }
+    if (exists(xbe) && xbe_title(xbe, title, &version) && version != want) {
+        snprintf(detail, dn, "This disc's Forza.xbe is \"%s\" version %u (SHA-1 %s). The port is made for one exact disc, "
+                 "Forza Motorsport (USA) (Rev 1), whose Forza.xbe is version %u: other editions and releases have other "
+                 "code, which the port cannot translate. Redump names the right one \"Forza Motorsport (USA) "
+                 "(En,Ja,Fr,De,Es,It,Pt,Zh,Ko) (Rev 1)\".", title, version, hex, want);
+        snprintf(head, hn, "This is another release of Forza Motorsport (version %u): the port needs the USA disc, Rev 1 "
+                 "(version %u).", version, want);
+    } else if (exists(xbe)) {
+        snprintf(detail, dn, "This Forza.xbe (SHA-1 %s) is not another release's, yet not the right one's either: the "
+                 "image may be damaged or modified. Make the image again from the disc, or try another copy.", hex);
+        snprintf(head, hn, "This Forza.xbe is damaged or modified: the port needs an unmodified Forza Motorsport (USA) (Rev 1).");
+    } else {
+        snprintf(xbe, sizeof xbe, "%s\\default.xbe", dir);
+        if (xbe_title(xbe, title, &version))
+            snprintf(head, hn, "This is \"%s\", not Forza Motorsport: the port needs Forza Motorsport (USA) (Rev 1).", title);
+        else
+            snprintf(head, hn, "No Forza.xbe here: choose the folder that holds the game's Forza.xbe and media folder.");
+    }
+    return 0;
+}
+
+/* copies the named files of a disc image's top folder (an XISO, or a full-disc dump: the volume where xiso_extract.py
+ * looks for it) into dir, so the disc can be checked before anything else; 0 if it is no Xbox disc image */
+static int iso_top_files(const char *iso, const char *dir, const char *const *names, int n) {
+    static const long long bases[] = {0, 0x18300000, 0x0FD90000, 0x02080000};
+    FILE *f = fopen(iso, "rb");
+    if (!f) return 0;
+    unsigned char vd[2048];
+    long long base = -1;
+    for (int i = 0; i < 4 && base < 0; i++)
+        if (!_fseeki64(f, bases[i] + 32 * 2048, SEEK_SET) && fread(vd, 1, 2048, f) == 2048 &&
+            !memcmp(vd, "MICROSOFT*XBOX*MEDIA", 20) && !memcmp(vd + 0x7EC, "MICROSOFT*XBOX*MEDIA", 20))
+            base = bases[i];
+    unsigned size = base < 0 ? 0 : *(unsigned *)(vd + 24);
+    unsigned char *t = size && size < (1u << 24) ? (unsigned char *)malloc(size) : NULL;
+    if (!t || _fseeki64(f, base + 2048LL * *(unsigned *)(vd + 20), SEEK_SET) || fread(t, 1, size, f) != size) {
+        free(t), fclose(f);
+        return 0;
+    }
+    CreateDirectoryA(dir, NULL);
+    /* the entries form a binary tree: left and right (dword offsets), sector, size, attributes, name length, name */
+    unsigned *stack = (unsigned *)malloc(sizeof(unsigned) * (size / 4 + 1)), sp = 0;
+    unsigned char *seen = (unsigned char *)calloc(size / 4 + 1, 1);
+    stack[sp++] = 0;
+    while (sp) {
+        unsigned off = stack[--sp];
+        if (off + 14 > size || seen[off / 4]) continue;
+        seen[off / 4] = 1;
+        unsigned left = *(unsigned short *)(t + off), right = *(unsigned short *)(t + off + 2);
+        unsigned sector = *(unsigned *)(t + off + 4), len = *(unsigned *)(t + off + 8), nlen = t[off + 13];
+        if (left == 0xFFFF) continue; /* padding */
+        if (left) stack[sp++] = left * 4;
+        if (right) stack[sp++] = right * 4;
+        if (t[off + 12] & 0x10 || off + 14 + nlen > size || len > (64u << 20)) continue;
+        char name[256], path[MAX_PATH];
+        memcpy(name, t + off + 14, nlen), name[nlen] = 0;
+        for (int k = 0; k < n; k++) {
+            if (_stricmp(name, names[k])) continue;
+            unsigned char *data = (unsigned char *)malloc(len ? len : 1);
+            snprintf(path, sizeof path, "%s\\%s", dir, names[k]);
+            FILE *o = data && !_fseeki64(f, base + 2048LL * sector, SEEK_SET) && fread(data, 1, len, f) == len
+                          ? fopen(path, "wb") : NULL;
+            if (o) fwrite(data, 1, len, o), fclose(o);
+            free(data);
+        }
+    }
+    free(stack), free(seen), free(t), fclose(f);
+    return 1;
+}
+
+/* the chosen ISO or folder is the disc this port was made for: as disc_check */
+static int source_check(const char *src, char *detail, size_t dn, char *head, size_t hn) {
+    if (!is_iso(src)) return disc_check(src, detail, dn, head, hn);
+    static const char *const names[] = {"Forza.xbe", "default.xbe"};
+    CreateDirectoryA("build", NULL);
+    int ok = 0;
+    detail[0] = 0;
+    if (!iso_top_files(src, "build\\disc", names, 2))
+        snprintf(head, hn, "This .iso is not an Xbox disc image, or cannot be read.");
+    else if (!exists("build\\disc\\Forza.xbe") && !exists("build\\disc\\default.xbe"))
+        snprintf(head, hn, "This disc image has no Forza.xbe: it is not Forza Motorsport (USA) (Rev 1).");
+    else
+        ok = disc_check("build\\disc", detail, dn, head, hn);
+    DeleteFileA("build\\disc\\Forza.xbe"), DeleteFileA("build\\disc\\default.xbe"), RemoveDirectoryA("build\\disc");
+    return ok;
+}
+
+/* the game folder already holds the right Forza.xbe (an ISO unpacked by an earlier build, or the chosen folder) */
+static int unpacked(void) {
+    char game[MAX_PATH], xbe[MAX_PATH], hex[41];
+    game_dir(game);
+    snprintf(xbe, sizeof xbe, "%s\\Forza.xbe", game);
+    return sha1_file(xbe, hex) && !strcmp(hex, XBE_SHA1);
+}
+
+/* on choosing (and at the start): whether it is the right disc, at once, under the chosen path */
+static char g_disc_note[256];
+static int g_disc_bad;
+static void check_source(void) {
+    char detail[1024], game[MAX_PATH];
+    game_dir(game);
+    g_disc_note[0] = 0, g_disc_bad = 0;
+    if (g_source[0])
+        g_disc_bad = !source_check(unpacked() ? game : g_source, detail, sizeof detail, g_disc_note, sizeof g_disc_note);
+}
+
+/* the build's check: what is wrong in the log, its headline last */
+static int source_ok(const char *src) {
+    char detail[1024], head[256];
+    if (source_check(src, detail, sizeof detail, head, sizeof head)) return 1;
+    post_log("%s%s%s\r\n", detail, detail[0] ? "\r\n" : "", head);
+    return 0;
+}
+
 static DWORD WINAPI build_thread(void *arg) {
     (void)arg;
-    char game[MAX_PATH], xbe[MAX_PATH], cmd[2048], hex[41];
+    char game[MAX_PATH], xbe[MAX_PATH], cmd[2048];
     int ok = 0;
     game_dir(game);
     snprintf(xbe, sizeof xbe, "%s\\Forza.xbe", game);
     step(0);
-    if (!fetch_tools()) goto done;
+    /* the disc first: a wrong one stops in seconds, before the tools' 95 MB and the disc's 3.6 GB (an ISO unpacked
+     * before is checked in game\, as the image may be gone) */
+    if (!source_ok(unpacked() ? game : g_source) || !fetch_tools()) goto done;
     if (is_iso(g_source)) {
         step(1);
-        char have[41] = "";
-        if (!exists(xbe) || !sha1_file(xbe, have) || strcmp(have, XBE_SHA1)) {
+        if (!unpacked()) {
             post_log("Extracting the ISO (3.6 GB)...\r\n");
             snprintf(cmd, sizeof cmd, "%s tools\\xiso_extract.py \"%s\" game", PYTHON, g_source);
             if (run(cmd)) goto done;
         }
     }
     step(2);
-    if (!sha1_file(xbe, hex)) {
-        post_log("%s was not found. Choose the folder that holds the game's Forza.xbe and media folder.\r\n", xbe);
-        goto done;
-    }
-    if (strcmp(hex, XBE_SHA1)) {
-        post_log("This Forza.xbe (SHA-1 %s) is not the one this port was made for: Forza Motorsport (USA) (Rev 1).\r\n", hex);
-        goto done;
-    }
+    if (!source_ok(game)) goto done; /* what was unpacked */
     post_log("Forza.xbe is Forza Motorsport (USA) (Rev 1).\r\n");
     step(3);
     CreateDirectoryA("analysis", NULL);
@@ -608,9 +810,49 @@ done:
 
 static void start_build(void) {
     if (!g_source[0] || InterlockedCompareExchange(&g_busy, 1, 0)) return;
-    g_cancel = 0, g_failed = 0, g_step = 0;
+    g_cancel = 0, g_failed = 0, g_step = 0, g_job = 0;
     SetWindowTextA(g_log, "");
     CloseHandle(CreateThread(NULL, 0, build_thread, NULL, 0, NULL));
+}
+
+/* Make 4x textures: every texture on the disc (tools/texextract.py, into build\textures\dump), each upscaled 4x
+ * (tools/texpack.py with Real-ESRGAN, into PACK_DIR), which the game loads with Texture pack on. Both skip what they
+ * did before, so after Cancel it picks up where it stopped. */
+static int pack_made(void) { return exists(PACK_DIR "\\aliases.txt"); }
+
+static DWORD WINAPI pack_thread(void *arg) {
+    (void)arg;
+    char game[MAX_PATH], cmd[2048];
+    int ok = 0;
+    ULARGE_INTEGER free_bytes;
+    game_dir(game);
+    step(0);
+    int need = exists(PACK_DIR) ? 2 : PACK_GB; /* picking up where it stopped: much of the room is taken already */
+    if (GetDiskFreeSpaceExA(g_root, &free_bytes, NULL, NULL) && free_bytes.QuadPart < (ULONGLONG)need << 30) {
+        post_log("This drive has %llu GB free; the 4x textures need about %d GB. Make room, then try again.\r\n",
+                 free_bytes.QuadPart >> 30, need);
+        goto done;
+    }
+    if (!fetch_tools() || !fetch(g_pack_tools, sizeof g_pack_tools / sizeof g_pack_tools[0])) goto done;
+    step(1);
+    snprintf(cmd, sizeof cmd, "%s tools\\texextract.py \"%s\" build\\textures\\dump", PYTHON, game);
+    if (run(cmd)) goto done;
+    step(2);
+    if (run(PYTHON " tools\\texpack.py --out " PACK_DIR)) goto done;
+    post_log("\r\nDone: the 4x textures are in " PACK_DIR ". Texture pack in Settings turns them on and off.\r\n");
+    ok = 1;
+done:
+    if (!ok) post_log(g_cancel ? "\r\nCancelled: Make 4x textures picks up where it stopped.\r\n"
+                               : "\r\nIt stopped; the log above says why.\r\n");
+    PostMessageA(g_wnd, WM_DONE, ok, 1);
+    return 0;
+}
+
+static void start_pack(void) {
+    if (!g_source[0] || InterlockedCompareExchange(&g_busy, 1, 0)) return;
+    g_cancel = 0, g_pack_failed = 0, g_step = 0, g_job = 1;
+    SetWindowTextA(g_log, "");
+    CloseHandle(CreateThread(NULL, 0, pack_thread, NULL, 0, NULL));
 }
 
 static void cancel_build(void) {
@@ -630,6 +872,7 @@ static int set_source(const char *path) {
     }
     snprintf(g_source, sizeof g_source, "%s", path);
     WritePrivateProfileStringA("launcher", "game", g_source, g_ini);
+    check_source();
     return 1;
 }
 
@@ -695,16 +938,28 @@ static void open_path(const char *rel_or_abs, int select_file) {
 
 typedef struct {
     const char *key, *label, *desc;
-    int def, n, values[5];
-    const char *names[5];
+    int def, n, values[8];
+    const char *names[8];
+    int tab; /* 0 Picture, 1 Game & sound (g_tab_names) */
 } Setting;
-static const Setting g_settings[] = {
+static const char *const g_tab_names[2] = {"Picture", "Game & sound"};
+static const Setting g_settings[] = { /* every row of the game's Recomp Settings, in two tabs of at most 13 */
+    {"language", "Language", "The language of the game's menus and text.", 1, 8, {1, 3, 4, 5, 6, 2, 7, 8},
+     {"English", "Deutsch", "Fran\xC3\xA7" "ais", "Espa\xC3\xB1ol", "Italiano", "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E",
+      "\xED\x95\x9C\xEA\xB5\xAD\xEC\x96\xB4", "\xE4\xB8\xAD\xE6\x96\x87"}, 1},
+    {"prompts", "Button prompts", "The buttons the game shows; Auto follows what you used last.", 0, 5, {0, 1, 2, 3, 4},
+     {"Auto", "Keyboard", "Xbox", "PlayStation", "Original"}, 1},
+    {"shoulders", "Shift on shoulders", "In a race, a controller's RB shifts up and LB down.", 0, 2, {0, 1},
+     {"Off", "On"}, 1},
+    {"rumble", "Rumble strength", "How hard controllers rumble; the game's Controller Options turn it off.", 100, 4,
+     {100, 75, 50, 25}, {"100%", "75%", "50%", "25%"}, 1},
+    {"achsound", "Achievement sound", "The game's fanfare when an achievement pops up.", 1, 2, {1, 0}, {"On", "Off"}, 1},
     {"renderscale", "Render scale", "Each frame drawn this many times larger: sharper, slower.", 2, 4, {1, 2, 3, 4},
      {"1x", "2x", "3x", "4x"}},
     {"fsr", "Upscaling", "NVIDIA DLSS (RTX) and AMD FSR 3 rebuild the picture from several frames.", 1, 4, {1, 2, 3, 0},
      {"FSR 1", "DLSS", "FSR 3", "Bilinear"}},
-    {"framerate", "Frame rate", "30 as on the Xbox. Above 60, races reach as many as this PC can draw.", 60, 4,
-     {60, 120, 144, 30}, {"60", "120", "144", "30"}},
+    {"framerate", "Frame rate", "Auto: your screen's refresh rate, so frames come evenly. 30 as on the Xbox.", 0, 5,
+     {0, 60, 120, 144, 30}, {"Auto", "60", "120", "144", "30"}},
     {"anisotropy", "Texture filter", "Keeps the road and other textures sharp at a distance.", 8, 5, {1, 2, 4, 8, 16},
      {"Off", "2x", "4x", "8x", "16x"}},
     {"fullscreen", "Borderless fullscreen", "Fill the whole screen, with no title bar or frame (Alt+Enter in the game).",
@@ -712,14 +967,35 @@ static const Setting g_settings[] = {
     {"widescreen", "Widescreen", "Native 16:9 picture instead of 4:3.", 1, 2, {1, 0}, {"On", "Off"}},
     {"ultrawide", "Ultrawide", "A wider view on an ultrawide screen; the HUD and menus stay 16:9.", 0, 2, {0, 1},
      {"Off", "On"}},
+    {"menusides", "Menu sides", "With Ultrawide: the menus' sides filled from their picture, blurred, or black.", 1, 2,
+     {1, 0}, {"Filled", "Black"}},
     {"videomode", "Video mode", "The game's own resolution; 720p and 1080i are HD.", 480, 3, {480, 720, 1080},
      {"480p", "720p", "1080i"}},
     {"texpack", "Texture pack", "Replacement textures, such as the 4x upscaled pack.", 1, 2, {1, 0}, {"On", "Off"}},
     {"videos", "Upscaled videos", "The cutscenes upscaled 4x in place of the originals.", 1, 2, {1, 0}, {"On", "Off"}},
-    {"enhaudio", "Enhanced audio", "Clearer sound, reverb, fuller bass and wider stereo.", 1, 2, {1, 0}, {"On", "Off"}},
-    {"speakers", "Speakers", "Auto plays the game's 5.1 mix on 5.1 and 7.1 speakers.", 0, 2, {0, 1}, {"Auto", "Stereo"}},
+    {"texdump", "Texture dump", "Saves every new texture to textures\\dump, to make a pack from.", 0, 2, {0, 1},
+     {"Off", "On"}},
+    {"enhaudio", "Enhanced audio", "Clearer sound, reverb, fuller bass and wider stereo.", 1, 2, {1, 0}, {"On", "Off"}, 1},
+    {"speakers", "Speakers", "Auto plays the game's 5.1 mix on 5.1 and 7.1 speakers.", 0, 2, {0, 1}, {"Auto", "Stereo"},
+     1},
 };
+static int g_tab; /* the settings tab shown */
 #define NSETTINGS (int)(sizeof g_settings / sizeof g_settings[0])
+
+/* the game's language number (as the Language setting) for Windows' display language; English if the game lacks it.
+ * The same in the runtime (kernel.c) */
+static int windows_language(void) {
+    switch (PRIMARYLANGID(GetUserDefaultUILanguage())) {
+    case LANG_JAPANESE: return 2;
+    case LANG_GERMAN: return 3;
+    case LANG_FRENCH: return 4;
+    case LANG_SPANISH: return 5;
+    case LANG_ITALIAN: return 6;
+    case LANG_KOREAN: return 7;
+    case LANG_CHINESE: return 8;
+    default: return 1;
+    }
+}
 
 static int setting_index(int i) { /* of the saved value; the default's if it is none of them */
     const Setting *s = &g_settings[i];
@@ -748,7 +1024,7 @@ static ID2D1HwndRenderTarget *g_rt;
 static IDWriteTextFormat *g_f_head, *g_f_sub, *g_f_body, *g_f_btn, *g_f_btn_big, *g_f_small, *g_f_logo, *g_f_logo2,
     *g_f_pct, *g_f_label;
 static float g_dpi = 96;
-static int g_page;      /* 0 main, 1 settings, 2 what's new */
+static int g_page;      /* 0 main, 1 settings, 2 what's new, 3 Make 4x textures */
 static int g_details;   /* the build's log shown */
 static int g_hover = -1, g_press = -1;
 static int g_focus = -1, g_pad_mode; /* the gamepad's or keyboard's item, and whether its ring shows (pad_poll) */
@@ -757,7 +1033,7 @@ static ULONGLONG g_anim; /* GetTickCount64 at start, for the progress shimmer */
 /* clickable things: ids; the rectangles of this frame (DIPs) */
 enum {
     B_ISO = 1, B_FOLDER, B_BUILD, B_PLAY, B_SETTINGS, B_DETAILS, B_CANCEL, B_DONE, B_SAVES, B_LOGS, B_GAME, B_REBUILD,
-    B_CHANGE, B_UPDATE, B_CHANGELOG, B_SET0 = 100 /* + setting: its value; + 50: its left arrow */
+    B_CHANGE, B_UPDATE, B_CHANGELOG, B_TAB0, B_TAB1, B_MODS, B_PACK, B_PACK_GO, B_SET0 = 100 /* + setting: its value; + 50: its left arrow */
 };
 typedef struct {
     int id;
@@ -939,21 +1215,30 @@ static void settings_summary(char *out, size_t n) {
 static void draw_main(float w, float h, float x0, float top) {
     float cw = w - x0 * 2 > 620 ? 620 : w - x0 * 2;
     if (g_busy) {
-        text("Building\xE2\x80\xA6", g_f_head, D2D1::RectF(x0, top, x0 + 900, top + 64), C_TEXT);
-        text("The first build takes about ten minutes; later ones only redo what changed.", g_f_sub,
-             D2D1::RectF(x0, top + 66, x0 + 900, top + 96), C_MUTED);
+        int pack = g_job == 1, s = g_step, steps = pack ? PACK_STEPS : STEPS;
+        text(pack ? "Making the 4x textures\xE2\x80\xA6" : "Building\xE2\x80\xA6", g_f_head, D2D1::RectF(x0, top, x0 + 900, top + 64), C_TEXT);
+        text(pack ? "An hour or more on a fast graphics card. Cancel stops it; it picks up where it stopped next time."
+                  : "The first build takes about ten minutes; later ones only redo what changed.",
+             g_f_sub, D2D1::RectF(x0, top + 66, x0 + 1000, top + 96), C_MUTED);
         D2D1_RECT_F card = D2D1::RectF(x0, top + 124, x0 + cw, top + 124 + 150);
         rounded(card, 14, rgb(0xFFFFFF, 0.045f), rgb(0xFFFFFF, 0.08f));
-        int s = g_step;
         char pct[16], what[256], detail[96];
-        snprintf(pct, sizeof pct, "%d%%", s * 100 / STEPS);
+        float frac; /* of the whole */
+        if (pack) { /* weighted, with the step's own progress */
+            float in = g_sub_total ? (float)g_sub_done / g_sub_total : 0;
+            int before = 0;
+            for (int i = 0; i < s; i++) before += g_pack_weight[i];
+            frac = (before + g_pack_weight[s] * in) / 100;
+            snprintf(pct, sizeof pct, "%d%%", (int)(frac * 100));
+        } else frac = (s + 0.5f) / STEPS, snprintf(pct, sizeof pct, "%d%%", s * 100 / STEPS);
         get_detail(detail, sizeof detail);
-        snprintf(what, sizeof what, "%s%s%s  (step %d of %d)", g_step_names[s], detail[0] ? ": " : "", detail, s + 1, STEPS);
+        snprintf(what, sizeof what, "%s%s%s  (step %d of %d)", pack ? g_pack_step_names[s] : g_step_names[s],
+                 detail[0] ? ": " : "", detail, s + 1, steps);
         text(pct, g_f_pct, D2D1::RectF(card.left + 24, card.top + 16, card.left + 200, card.top + 66), C_TEXT);
         text(what, g_f_body, D2D1::RectF(card.left + 24, card.top + 68, card.right - 24, card.top + 92), C_MUTED);
         D2D1_RECT_F bar = D2D1::RectF(card.left + 24, card.top + 104, card.right - 24, card.top + 110);
         rounded(bar, 3, rgb(0xFFFFFF, 0.08f), rgb(0, 0));
-        float done = (bar.right - bar.left) * (s + 0.5f) / STEPS;
+        float done = (bar.right - bar.left) * frac;
         rounded(D2D1::RectF(bar.left, bar.top, bar.left + done, bar.bottom), 3, rgb(C_RED), rgb(0, 0));
         float phase = (float)((GetTickCount64() - g_anim) % 1600) / 1600; /* a light running along the done part */
         float sx = bar.left + (done + 120) * phase - 120;
@@ -985,6 +1270,12 @@ static void draw_main(float w, float h, float x0, float top) {
             sink->Release(), path->Release();
         }
         button(B_SETTINGS, "Settings", D2D1::RectF(x0 + 266, top + 132, x0 + 406, top + 196), 1);
+        if (!pack_made()) button(B_PACK, g_pack_failed ? "4x textures: try again" : "Make 4x textures",
+                                 D2D1::RectF(x0 + 422, top + 132, x0 + 642, top + 196), 1);
+        if (g_pack_failed) { /* why the last Make 4x textures stopped, over the game's path; the log under it */
+            text(g_fail_line, g_f_small, D2D1::RectF(x0, top + 100, w - x0, top + 124), C_AMBER);
+            button(B_DETAILS, g_details ? "Hide details" : "Show details", D2D1::RectF(x0 + 658, top + 150, x0 + 778, top + 178), 2);
+        }
         char src[MAX_PATH + 32];
         snprintf(src, sizeof src, "Game: %s", g_source);
         text(src, g_f_small, D2D1::RectF(x0, top + 214, x0 + 700, top + 236), C_FAINT);
@@ -999,9 +1290,12 @@ static void draw_main(float w, float h, float x0, float top) {
         button(B_CHANGE, "Choose another copy", D2D1::RectF(x0 + 346, top + 132, x0 + 506, top + 160), 2);
         return;
     }
-    text("Build your copy", g_f_head, D2D1::RectF(x0, top, x0 + 900, top + 64), C_TEXT);
-    text(g_failed ? g_fail_line : "Forza Motorsport is recompiled on this PC from your own disc. Nothing is uploaded.",
-         g_f_sub, D2D1::RectF(x0, top + 66, x0 + 1000, top + 96), g_failed ? C_AMBER : C_MUTED);
+    int update = built_once(); /* built by an earlier version */
+    text(update ? "Update your build" : "Build your copy", g_f_head, D2D1::RectF(x0, top, x0 + 900, top + 64), C_TEXT);
+    text(g_failed ? g_fail_line : g_disc_bad ? g_disc_note
+         : update ? "This version changes the game too, so it is built again from your disc. Saves and settings stay."
+                  : "Forza Motorsport is recompiled on this PC from your own disc. Nothing is uploaded.",
+         g_f_sub, D2D1::RectF(x0, top + 66, x0 + 1000, top + 96), g_failed || g_disc_bad ? C_AMBER : C_MUTED);
     D2D1_RECT_F card = D2D1::RectF(x0, top + 124, x0 + cw, top + 124 + 176);
     rounded(card, 14, rgb(0xFFFFFF, 0.045f), rgb(0xFFFFFF, 0.08f));
     D2D1_RECT_F drop = D2D1::RectF(card.left + 16, card.top + 16, card.right - 16, card.top + 88);
@@ -1015,13 +1309,32 @@ static void draw_main(float w, float h, float x0, float top) {
          C_MUTED, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
     button(B_ISO, "Choose disc image", D2D1::RectF(card.left + 16, card.top + 104, card.left + 196, card.top + 144), 1);
     button(B_FOLDER, "Choose game folder", D2D1::RectF(card.left + 206, card.top + 104, card.left + 396, card.top + 144), 1);
-    text(g_source[0] ? g_source : "Forza Motorsport (Xbox, USA). Nothing chosen yet.", g_f_small,
+    char src[MAX_PATH + 300]; /* the path, and whether it is the right disc (wrong: the line above says why) */
+    snprintf(src, sizeof src, "%s%s%s", g_source, g_disc_bad || !g_disc_note[0] ? "" : "  \xC2\xB7  ", g_disc_bad ? "" : g_disc_note);
+    text(g_source[0] ? src : "Forza Motorsport (Xbox, USA). Nothing chosen yet.", g_f_small,
          D2D1::RectF(card.left + 18, card.top + 148, card.right - 16, card.top + 172), g_source[0] ? C_TEXT : C_FAINT);
-    button(B_BUILD, g_failed ? "Try again" : "Build", D2D1::RectF(x0, card.bottom + 24, x0 + 220, card.bottom + 80), 0,
+    button(B_BUILD, g_failed ? "Try again" : update ? "Update" : "Build", D2D1::RectF(x0, card.bottom + 24, x0 + 220, card.bottom + 80), 0,
            g_source[0] != 0, g_f_btn_big);
     if (g_failed) button(B_DETAILS, g_details ? "Hide details" : "Show details", D2D1::RectF(x0 + 236, card.bottom + 38, x0 + 360, card.bottom + 66), 2);
-    else text("Nothing to install. The first build downloads its tools (about 95 MB) and the upscalers.",
+    else text(update ? "It takes a few minutes, like the first build." : "Nothing to install. The first build downloads its tools (about 95 MB) and the upscalers.",
               g_f_small, D2D1::RectF(x0 + 240, card.bottom + 24, x0 + 900, card.bottom + 80), C_FAINT);
+}
+
+/* page 3: what Make 4x textures does, before it starts */
+static void draw_pack(float w, float h, float x0, float top) {
+    float cw = w - x0 * 2 > 760 ? 760 : w - x0 * 2;
+    text("4x textures", g_f_head, D2D1::RectF(x0, top, x0 + 900, top + 64), C_TEXT);
+    text("Every texture on your disc, made four times as detailed with Real-ESRGAN on your graphics card: sharper roads, "
+         "cars, signs and scenery. Like the build, it is made on this PC from your own disc.",
+         g_f_body, D2D1::RectF(x0, top + 70, x0 + cw, top + 130), C_TEXT);
+    text("It takes about an hour and a half on a fast graphics card, and several hours on others. Cancel stops it at "
+         "any time, and the next time it picks up where it stopped. It needs about 12 GB of free space and a graphics "
+         "card with Vulkan (any from the last ten years). The first time, it downloads its tools: Real-ESRGAN and two "
+         "Python packages, about 67 MB.",
+         g_f_body, D2D1::RectF(x0, top + 134, x0 + cw, top + 230), C_MUTED);
+    button(B_PACK_GO, exists(PACK_DIR) ? "Carry on" : "Make them", D2D1::RectF(x0, top + 246, x0 + 220, top + 302), 0, 1, g_f_btn_big);
+    button(B_DONE, "Back", D2D1::RectF(x0 + 236, top + 256, x0 + 336, top + 292), 2);
+    (void)h;
 }
 
 static void draw_settings(float w, float h, float x0, float top) {
@@ -1030,12 +1343,23 @@ static void draw_settings(float w, float h, float x0, float top) {
     text("Settings", g_f_head, D2D1::RectF(x0, top, x0 + 600, top + 64), C_TEXT);
     text("The same as Recomp Settings in the game's main menu. Click a value to change it.", g_f_sub,
          D2D1::RectF(x0, top + 62, x0 + 900, top + 88), C_MUTED);
+    for (int t = 0; t < 2; t++) { /* the tabs, beside the title; LB / RB (Tab on the keyboard) switch them too */
+        D2D1_RECT_F r = D2D1::RectF(x0 + 200 + 160 * t, top + 16, x0 + 350 + 160 * t, top + 52);
+        int id = B_TAB0 + t, on = g_tab == t;
+        if (on || g_hover == id) rounded(r, 10, rgb(0xFFFFFF, on ? 0.10f : 0.05f), rgb(0xFFFFFF, on ? 0.16f : 0.08f));
+        if (on) g_rt->FillRectangle(D2D1::RectF(r.left + 18, r.bottom - 3, r.right - 18, r.bottom - 1), brush(rgb(C_RED)));
+        text(g_tab_names[t], g_f_label, r, on ? C_TEXT : C_MUTED, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+        hit(id, r);
+    }
     button(B_DONE, "Done", D2D1::RectF(x0 + cw - 140, top + 12, x0 + cw, top + 56), 0);
-    D2D1_RECT_F card = D2D1::RectF(x0, y, x0 + cw, y + rowh * NSETTINGS + 12);
+    int rows = 0;
+    for (int i = 0; i < NSETTINGS; i++) rows += g_settings[i].tab == g_tab;
+    D2D1_RECT_F card = D2D1::RectF(x0, y, x0 + cw, y + rowh * rows + 12);
     rounded(card, 14, rgb(0x0E0A0B, 0.92f), rgb(0xFFFFFF, 0.08f)); /* opaque enough that the dial stays behind */
-    for (int i = 0; i < NSETTINGS; i++) {
-        float ry = y + 6 + rowh * i;
-        if (i) g_rt->DrawLine(D2D1::Point2F(card.left + 16, ry), D2D1::Point2F(card.right - 16, ry), brush(rgb(0xFFFFFF, 0.05f)), 1);
+    for (int i = 0, row = 0; i < NSETTINGS; i++) {
+        if (g_settings[i].tab != g_tab) continue;
+        float ry = y + 6 + rowh * row;
+        if (row++) g_rt->DrawLine(D2D1::Point2F(card.left + 16, ry), D2D1::Point2F(card.right - 16, ry), brush(rgb(0xFFFFFF, 0.05f)), 1);
         text(g_settings[i].label, g_f_label, D2D1::RectF(card.left + 20, ry, card.left + 190, ry + rowh), C_TEXT);
         text(g_settings[i].desc, g_f_small, D2D1::RectF(card.left + 190, ry, card.right - 200, ry + rowh), C_FAINT);
         D2D1_RECT_F val = D2D1::RectF(card.right - 180, ry + 8, card.right - 20, ry + rowh - 8);
@@ -1092,6 +1416,7 @@ static void draw(void) {
     float top = h * 0.24f < 150 ? 150 : h * 0.24f;
     if (g_page == 1) draw_settings(w, h, x0, top);
     else if (g_page == 2 && g_news) draw_news(w, h, x0);
+    else if (g_page == 3 && !g_busy) draw_pack(w, h, x0, top);
     else draw_main(w, h, x0, top);
     /* the footer */
     g_rt->FillRectangle(D2D1::RectF(0, h - 48, w, h), brush(rgb(0x070506, 0.92f)));
@@ -1099,9 +1424,9 @@ static void draw(void) {
     static const struct {
         int id;
         const char *label;
-    } links[] = {{B_REBUILD, "Rebuild"}, {B_GAME, "Game folder"}, {B_LOGS, "Logs"}, {B_SAVES, "Saves"}};
+    } links[] = {{B_REBUILD, "Rebuild"}, {B_GAME, "Game folder"}, {B_MODS, "Mods"}, {B_LOGS, "Logs"}, {B_SAVES, "Saves"}};
     float x = w - x0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < (int)(sizeof links / sizeof links[0]); i++) {
         if (links[i].id == B_REBUILD && (!built() || g_busy)) continue;
         float tw = text_width(links[i].label, g_f_small) + 20;
         button(links[i].id, links[i].label, D2D1::RectF(x - tw, h - 46, x, h - 2), 2);
@@ -1124,8 +1449,8 @@ static void place_log(void) {
     RECT cr;
     GetClientRect(g_wnd, &cr);
     float s = g_dpi / 96, w = cr.right / s, h = cr.bottom / s, x0 = w > 1000 ? 72.0f : 40.0f;
-    float top = (h * 0.24f < 150 ? 150 : h * 0.24f) + (g_busy ? 124 + 150 + 16 : 190);
-    int show = g_details && g_page == 0 && (g_busy || g_failed) && h - 64 - top > 60;
+    float top = (h * 0.24f < 150 ? 150 : h * 0.24f) + (g_busy ? 124 + 150 + 16 : g_pack_failed && !g_failed ? 250 : 190);
+    int show = g_details && g_page == 0 && (g_busy || g_failed || g_pack_failed) && h - 64 - top > 60;
     SetWindowPos(g_log, NULL, (int)(x0 * s), (int)(top * s), (int)((w - 2 * x0) * s), (int)((h - 64 - top) * s),
                  SWP_NOZORDER | (show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
 }
@@ -1144,12 +1469,16 @@ static void click(int id) {
     switch (id) {
     case B_ISO: choose(1); break;
     case B_FOLDER: choose(0); break;
-    case B_CHANGE: g_failed = 0; g_source[0] = 0; break;
+    case B_CHANGE: g_failed = 0; g_source[0] = 0; check_source(); break;
     case B_BUILD:
     case B_REBUILD: g_page = 0; start_build(); break;
     case B_PLAY: play(); break;
     case B_SETTINGS: g_page = 1; break;
     case B_DONE: g_page = 0; break;
+    case B_PACK: g_page = 3; break;
+    case B_PACK_GO: g_page = 0; start_pack(); break;
+    case B_TAB0:
+    case B_TAB1: g_tab = id - B_TAB0; break;
     case B_DETAILS: g_details ^= 1; break;
     case B_CANCEL: cancel_build(); break;
     case B_UPDATE: update_offer(); break;
@@ -1167,6 +1496,17 @@ static void click(int id) {
         break;
     }
     case B_LOGS: open_path("build\\redline.log", 1); break;
+    case B_MODS: { /* the game reads mods from beside its game folder, as hdd; made here so there is one to open */
+        char game[MAX_PATH], p[MAX_PATH * 2];
+        game_dir(game);
+        if (g_source[0]) snprintf(p, sizeof p, "%s\\..\\mods", game);
+        else snprintf(p, sizeof p, "%s\\mods", g_root);
+        char full[MAX_PATH];
+        if (GetFullPathNameA(p, MAX_PATH, full, NULL)) snprintf(p, sizeof p, "%s", full); /* no "..": Explorer shows it */
+        CreateDirectoryA(p, NULL);
+        open_path(p, 0);
+        break;
+    }
     case B_GAME: {
         char game[MAX_PATH];
         game_dir(game);
@@ -1199,8 +1539,8 @@ static const Hit *hit_of(int id) {
 static int navigable(int id) { return id < B_SET0 + 50; } /* not a setting's left arrow: left and right step it */
 
 static void focus_default(void) { /* the page's main action, else its first item */
-    static const int first[] = {B_PLAY, B_BUILD, B_DONE};
-    for (int i = 0; i < 3; i++)
+    static const int first[] = {B_PACK_GO, B_PLAY, B_BUILD, B_DONE};
+    for (int i = 0; i < 4; i++)
         if (hit_of(first[i])) {
             g_focus = first[i];
             return;
@@ -1246,6 +1586,12 @@ static void pad_choose(void) {
     else click(g_focus);
     InvalidateRect(g_wnd, NULL, FALSE);
 }
+static void pad_tab(void) { /* LB / RB, Tab: the other settings tab, the ring on its name */
+    if (g_page != 1) return;
+    g_tab ^= 1;
+    if (g_pad_mode) g_focus = B_TAB0 + g_tab;
+    InvalidateRect(g_wnd, NULL, FALSE);
+}
 static void pad_back(void) { /* never Cancel: a build stops only on purpose */
     g_pad_mode = 1;
     if (g_page) g_page = 0;
@@ -1287,6 +1633,7 @@ static void pad_poll(void) {
     if (down & XINPUT_GAMEPAD_DPAD_RIGHT) pad_nav(1, 0);
     if (down & XINPUT_GAMEPAD_A) pad_choose();
     if (down & XINPUT_GAMEPAD_B) pad_back();
+    if (down & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER)) pad_tab();
 }
 
 static HBRUSH g_log_brush;
@@ -1372,6 +1719,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case VK_SPACE: pad_choose(); return 0;
         case VK_ESCAPE:
         case VK_BACK: pad_back(); return 0;
+        case VK_TAB: pad_tab(); return 0;
         }
         break;
     case WM_LOG: {
@@ -1381,16 +1729,18 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageA(g_log, EM_SETSEL, len, len);
         SendMessageA(g_log, EM_REPLACESEL, 0, (LPARAM)t);
         for (char *line = strtok(t, "\r\n"); line; line = strtok(NULL, "\r\n")) /* the last real line, for a failure */
-            if (strlen(line) > 3 && line[0] != '>' && strncmp(line, "The build stopped", 17) && strncmp(line, "Cancelled", 9))
+            if (strlen(line) > 3 && line[0] != '>' && strncmp(line, "The build stopped", 17) && strncmp(line, "Cancelled", 9) &&
+                strncmp(line, "It stopped", 10))
                 snprintf(g_fail_line, sizeof g_fail_line, "%s", line);
         free(t);
         return 0;
     }
     case WM_STEP:
     case WM_UPDATE: InvalidateRect(h, NULL, FALSE); return 0;
-    case WM_DONE:
+    case WM_DONE: /* lParam 1: Make 4x textures, which stays on the Ready page either way */
         InterlockedExchange(&g_busy, 0);
-        g_failed = !wp && !g_cancel;
+        if (lp) g_pack_failed = !wp && !g_cancel, g_details = g_pack_failed;
+        else g_failed = !wp && !g_cancel;
         if (g_failed) g_details = 1;
         if (wp) FlashWindow(h, TRUE);
         place_log();
@@ -1402,7 +1752,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         SetBkColor((HDC)wp, RGB(0x10, 0x0C, 0x0D));
         return (LRESULT)g_log_brush;
     case WM_CLOSE:
-        if (g_busy && MessageBoxA(h, "A build is running. Close anyway?", RECOMP_NAME, MB_YESNO | MB_ICONQUESTION) != IDYES)
+        if (g_busy && MessageBoxA(h, g_job ? "The 4x textures are being made (it picks up where it stopped next time). Close anyway?"
+                                           : "A build is running. Close anyway?", RECOMP_NAME, MB_YESNO | MB_ICONQUESTION) != IDYES)
             return 0;
         cancel_build();
         break;
@@ -1420,8 +1771,15 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     SetCurrentDirectoryA(g_root);
     snprintf(g_ini, sizeof g_ini, "%s\\launcher.ini", g_root);
     snprintf(g_rini, sizeof g_rini, "%s\\build\\recomp.ini", g_root);
+    if (!GetPrivateProfileIntA("recomp", "language", 0, g_rini)) { /* until chosen, Windows' display language */
+        char v[4];
+        snprintf(v, sizeof v, "%d", windows_language());
+        CreateDirectoryA("build", NULL);
+        WritePrivateProfileStringA("recomp", "language", v, g_rini);
+    }
     GetPrivateProfileStringA("launcher", "game", "", g_source, MAX_PATH, g_ini);
     if (!g_source[0] && exists("game\\Forza.xbe")) GetFullPathNameA("game", MAX_PATH, g_source, NULL);
+    check_source();
     { /* the first start of this version: what's new, if it came over an older one (launcher.ini there already) */
         char seen[32];
         GetPrivateProfileStringA("launcher", "seen_version", "", seen, sizeof seen, g_ini);

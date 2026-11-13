@@ -176,6 +176,7 @@ static int store(Slot *s, IMFSample *sample, LONG num) {
 }
 
 static DWORD WINAPI decoder(void *arg) {
+    thread_name("video decoder");
     Slot *s = arg;
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
     IMFAttributes *a = NULL;

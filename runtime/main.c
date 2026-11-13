@@ -605,6 +605,7 @@ int main(int argc, char **argv) {
 
     static X86Ctx ctx;
     thread_env_init(&ctx, 256 * 1024, 0);
+    thread_name("guest main");
     fprintf(stderr, RECOMP_NAME " " RECOMP_VERSION ": entry %08X, kernel thunk %08X\n", g_xbe.entry, g_xbe.kernel_thunk);
     watchdog_start();
     /* 1 ms sleeps: without this Sleep(1) lasts a 15.6 ms timer tick, so the DPC thread's 60 Hz vblank ran at 48 Hz

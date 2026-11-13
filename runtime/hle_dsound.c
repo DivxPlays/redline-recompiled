@@ -119,7 +119,7 @@ static const int16_t g_ima_step[89] = {
     32767};
 static const int8_t g_ima_index[16] = {-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
 
-static void adpcm_block(const uint8_t *in, int ch, int16_t *out) {
+void adpcm_block(const uint8_t *in, int ch, int16_t *out) {
     for (int c = 0; c < ch; c++) {
         int pred = (int16_t)(in[4 * c] | in[4 * c + 1] << 8), idx = in[4 * c + 2] > 88 ? 88 : in[4 * c + 2];
         out[c] = (int16_t)pred;

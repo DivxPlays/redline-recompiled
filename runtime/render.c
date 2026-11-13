@@ -14,6 +14,8 @@
 #include <dxgi1_6.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <tlhelp32.h>
+#include <intrin.h>
 
 #include "pgraph.h"
 #include "icons.h"
@@ -108,8 +110,93 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcA(h, msg, wp, lp);
 }
 
+/* The screen's own vblank, for the emulated one to keep step with (thread.c dpc_proc): this thread waits for each on
+ * the output the window is on and keeps when the last came and the refresh period, in QPC milliseconds. Without them
+ * (no output, a remote desktop, a wait that returns at once) the emulated vblank keeps its own clock. */
+static double g_vb_last, g_vb_period;
+static SRWLOCK g_vb_lock = SRWLOCK_INIT;
+
+static void vb_publish(double last, double period) {
+    AcquireSRWLockExclusive(&g_vb_lock);
+    g_vb_last = last, g_vb_period = period;
+    ReleaseSRWLockExclusive(&g_vb_lock);
+}
+
+/* the screen the window is on (its device name, for EnumDisplaySettings), NULL before there is a window */
+const char *render_screen(void) {
+    static MONITORINFOEXA mi;
+    mi.cbSize = sizeof mi;
+    return g_hwnd && GetMonitorInfoA(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), (MONITORINFO *)&mi) ? mi.szDevice
+                                                                                                             : NULL;
+}
+
+int display_vblank(double *last, double *period) {
+    AcquireSRWLockShared(&g_vb_lock);
+    *last = g_vb_last, *period = g_vb_period;
+    ReleaseSRWLockShared(&g_vb_lock);
+    return *period > 0;
+}
+
+static IDXGIOutput *output_of(IDXGIFactory1 *f, HMONITOR m) { /* any adapter's: a laptop's screen may be the iGPU's */
+    IDXGIAdapter1 *a;
+    for (UINT i = 0; IDXGIFactory1_EnumAdapters1(f, i, &a) == S_OK; i++) {
+        IDXGIOutput *o;
+        for (UINT j = 0; IDXGIAdapter1_EnumOutputs(a, j, &o) == S_OK; j++) {
+            DXGI_OUTPUT_DESC d;
+            if (SUCCEEDED(IDXGIOutput_GetDesc(o, &d)) && d.Monitor == m) return IDXGIAdapter1_Release(a), o;
+            IDXGIOutput_Release(o);
+        }
+        IDXGIAdapter1_Release(a);
+    }
+    return NULL;
+}
+
+static DWORD WINAPI vblank_watch(void *p) {
+    thread_name("display vblank");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL); /* when it wakes is the measurement */
+    IDXGIFactory1 *f;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f))) return 0;
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    HMONITOR mon = NULL;
+    IDXGIOutput *out = NULL;
+    double last = 0, period = 0;
+    int settled = 0;
+    for (;;) {
+        HMONITOR m = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY);
+        if (m != mon || !out) { /* the first time, the window moved to another screen, or the screen went */
+            if (out) IDXGIOutput_Release(out);
+            if (!IDXGIFactory1_IsCurrent(f)) { /* screens were plugged or unplugged */
+                IDXGIFactory1_Release(f);
+                if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f))) return vb_publish(0, 0), 0;
+            }
+            out = output_of(f, mon = m), last = period = 0, settled = 0;
+            vb_publish(0, 0);
+        }
+        if (!out || FAILED(IDXGIOutput_WaitForVBlank(out))) {
+            if (out) IDXGIOutput_Release(out), out = NULL;
+            Sleep(500);
+            continue;
+        }
+        LARGE_INTEGER q;
+        QueryPerformanceCounter(&q);
+        double t = q.QuadPart * 1000.0 / qf.QuadPart, dt = t - last;
+        if (dt < 2) { /* returned at once: no real vblank behind it (a remote desktop, the screen asleep) */
+            vb_publish(0, 0), settled = 0, period = 0;
+            Sleep(100);
+        } else if (period && dt > period * 0.75 && dt < period * 1.25) { /* a missed one (2x) only moves the time */
+            period += (dt - period) / 64;
+            if (++settled == 256) fprintf(stderr, "[render] the screen refreshes at %.3f Hz\n", 1000 / period);
+            if (settled >= 64) vb_publish(t, period);
+        } else if (!period && last && dt < 50)
+            period = dt;
+        last = t;
+    }
+}
+
 /* the window lives on its own thread so its message loop never waits on the guest */
 static DWORD WINAPI window_thread(void *ready) {
+    thread_name("window");
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = wndproc;
     wc.hInstance = GetModuleHandleA(NULL);
@@ -241,6 +328,7 @@ void render_init(void) {
     hr = IDXGIFactory2_CreateSwapChainForHwnd(factory, (IUnknown *)g_dev, g_hwnd, &sd, NULL, NULL, &g_swap);
     if (FAILED(hr)) fail("CreateSwapChainForHwnd", hr);
     IDXGIFactory2_MakeWindowAssociation(factory, g_hwnd, DXGI_MWA_NO_ALT_ENTER); /* wndproc's own Alt+Enter */
+    CloseHandle(CreateThread(NULL, 0, vblank_watch, NULL, 0, NULL));
     IDXGIFactory2_Release(factory);
     IDXGIAdapter_Release(adapter);
     IDXGIDevice_Release(dxgi_dev);
@@ -288,6 +376,7 @@ void render_init(void) {
 
 typedef struct {
     uint32_t addr, w, h; /* guest address and size in guest pixels (AA included) */
+    uint32_t sw, sh;     /* the size of the surface last drawn into it, its top-left corner (0: not drawn) */
     UINT hw, hh;         /* host size: RENDER_SCALE times (an AA'd screen half as wide), a screen's g_widen times as wide */
     int depth, wide;
     ID3D11Texture2D *tex;
@@ -295,12 +384,18 @@ typedef struct {
     ID3D11DepthStencilView *dsv;
     ID3D11ShaderResourceView *srv;
     uint32_t used; /* g_frame it was last drawn to or read */
+    /* read back and not drawn since: the guest memory is its picture (mem_size bytes, hash mem_hash, compared once a
+     * frame, at mem_checked); rewritten: the game has written something else there since, which textures then read */
+    int mem_valid, rewritten;
+    uint32_t mem_size, mem_checked;
+    uint64_t mem_hash;
     ID3D11Texture2D *mv; /* the scene's motion (screen UV, a frame ago minus now; R16G16F), made when first wanted */
     ID3D11RenderTargetView *mv_rtv;
     ID3D11ShaderResourceView *mv_srv;
 } Target;
 static Target g_targets[MAX_TARGETS];
 static uint32_t g_frame; /* frames presented (defined with the textures) */
+static uint32_t g_wide3d_frame; /* the last present whose frame drew 3D on a wide target (ui_squeeze) */
 
 static Target *find_target(uint32_t addr, int depth) {
     for (int i = 0; i < MAX_TARGETS; i++)
@@ -316,6 +411,7 @@ static Target *find_target(uint32_t addr, int depth) {
  * targets and compressing them to DXT5 itself, and the car's icon by copying 128x64 of the screen: they were saved
  * as zeros, a near-black car in races and My Cars and a black icon. fmt and size are the D3D resource's Format and
  * Size; 32-bit colour only. Each guest pixel is the average of the host pixels over it. */
+static void screenshot(ID3D11Texture2D *tex, const char *path);
 static void render_readback_(uint32_t addr, uint32_t fmt, uint32_t size) {
     Target *t = find_target(addr, 0);
     uint32_t color = (fmt >> 8) & 0xFF, lin = color == 0x12 || color == 0x1E; /* LIN_A8R8G8B8, LIN_X8R8G8B8 */
@@ -324,10 +420,14 @@ static void render_readback_(uint32_t addr, uint32_t fmt, uint32_t size) {
     uint32_t pitch = ((size >> 24) + 1) * 64;
     D3D11_TEXTURE2D_DESC td;
     ID3D11Texture2D_GetDesc(t->tex, &td);
-    /* host pixels per guest pixel (render scale, AA); a wide screen target (ULTRAWIDE) gives its middle 16:9, the
-     * picture the game drew its 640 columns for: the car's icon is copied off the screen */
-    float fx = (float)td.Width / (t->wide ? g_widen : 1) / w, x_off = (td.Width - fx * w) / 2;
-    uint32_t sy = td.Height / h;
+    /* the picture is the surface last drawn into the target (sw x sh guest pixels), read into w x h: the game's
+     * anti-aliasing draws the screen twice as wide and reads it at its own width; a target kept the size of a bigger
+     * surface at its address has the picture in its top-left corner only (#26: a car's icon, read as all of a
+     * 160-wide target, came out squeezed beside black). px: host pixels per guest pixel (render scale, AA); a wide
+     * screen target (ULTRAWIDE) gives its middle 16:9, the picture the game drew its 640 columns for */
+    uint32_t dw = t->sw ? t->sw : t->w, dh = t->sh ? t->sh : t->h;
+    float px = (float)td.Width / (t->wide ? g_widen : 1) / t->w, fx = px * dw / w, x_off = (td.Width - px * t->w) / 2;
+    uint32_t sy = td.Height / t->h * dh / h;
     if (fx < 1 || !sy) return;
     td.Usage = D3D11_USAGE_STAGING, td.BindFlags = 0, td.CPUAccessFlags = D3D11_CPU_ACCESS_READ, td.MiscFlags = 0;
     ID3D11Texture2D *st;
@@ -346,7 +446,14 @@ static void render_readback_(uint32_t addr, uint32_t fmt, uint32_t size) {
                 for (int k = 0; k < 4; k++) d[k] = (uint8_t)(sum[k] / (sx * sy)); /* B8G8R8A8: A8R8G8B8's bytes */
             }
         ID3D11DeviceContext1_Unmap(g_ctx, (ID3D11Resource *)st, 0);
+        t->mem_size = lin ? h * pitch : w * h * 4, t->mem_hash = hash_bytes(g_mem + addr, t->mem_size, 0);
+        t->mem_valid = 1, t->rewritten = 0, t->mem_checked = g_frame;
         fprintf(stderr, "[render] target %08X read back (%ux%u%s)\n", addr, w, h, lin ? "" : ", swizzled");
+        if (getenv("READBACKDUMP")) { /* the host target as read, alpha included: build/rb_<address>.bmp */
+            char path[64];
+            snprintf(path, sizeof path, "build/rb_%08X.bmp", addr);
+            screenshot(t->tex, path);
+        }
         achieve_readback(w, h); /* a paint job saved draws its livery at 1024 */
     }
     ID3D11Texture2D_Release(st);
@@ -366,6 +473,28 @@ static void release_target(Target *t) {
     if (t->srv) ID3D11ShaderResourceView_Release(t->srv);
     if (t->tex) ID3D11Texture2D_Release(t->tex);
     memset(t, 0, sizeof *t);
+}
+
+/* a copy of colour target t, for a draw that reads the target it draws into (D3D cannot bind it both ways); one,
+ * remade when the size changes */
+static ID3D11ShaderResourceView *target_copy(Target *t) {
+    static ID3D11Texture2D *tex;
+    static ID3D11ShaderResourceView *srv;
+    D3D11_TEXTURE2D_DESC td, cd;
+    ID3D11Texture2D_GetDesc(t->tex, &td);
+    if (tex) ID3D11Texture2D_GetDesc(tex, &cd);
+    if (!tex || cd.Width != td.Width || cd.Height != td.Height || cd.Format != td.Format) {
+        if (srv) ID3D11ShaderResourceView_Release(srv), srv = NULL;
+        if (tex) ID3D11Texture2D_Release(tex), tex = NULL;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(g_dev, &td, NULL, &tex)) ||
+            FAILED(ID3D11Device_CreateShaderResourceView(g_dev, (ID3D11Resource *)tex, NULL, &srv))) {
+            if (tex) ID3D11Texture2D_Release(tex), tex = NULL;
+            return g_dummy_srv;
+        }
+    }
+    ID3D11DeviceContext1_CopyResource(g_ctx, (ID3D11Resource *)tex, (ID3D11Resource *)t->tex);
+    return srv;
 }
 
 /* host target for a colour (depth = 0) or depth surface, created or resized on demand */
@@ -540,6 +669,7 @@ void render_clear(const Surface *s, uint32_t flags, uint32_t argb, uint32_t zste
     }
     if ((flags & 0xF0) && s->color_addr) { /* NV097_CLEAR_SURFACE: [4] R, [5] G, [6] B, [7] A */
         Target *t = target(s->color_addr, s->width, s->height, 0);
+        t->mem_valid = t->rewritten = 0;
         D3D11_RECT r = clear_rect(t, s, x0, y0, x1, y1);
         float c[4] = {((argb >> 16) & 0xFF) / 255.0f, ((argb >> 8) & 0xFF) / 255.0f, (argb & 0xFF) / 255.0f,
                       (argb >> 24) / 255.0f};
@@ -616,6 +746,8 @@ static void *compile_shader(const char *src, int pixel, const char *path) {
 
 static DWORD WINAPI shader_worker(void *p) {
     (void)p;
+    thread_name("shader compiler");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL); /* as texpack.c's loaders: the game first */
     for (;;) {
         AcquireSRWLockExclusive(&g_job_lock);
         while (!g_job_head) SleepConditionVariableSRW(&g_job_cv, &g_job_lock, INFINITE, 0);
@@ -853,7 +985,18 @@ static ID3D11ShaderResourceView *target_cube(uint32_t addr, uint32_t face, Targe
 static Target *texture_target(const TexDesc *t) {
     uint32_t color = (t->format >> 8) & 0xFF;
     if (color == 0x0B || color == 0x0C || color == 0x0E || color == 0x0F) return NULL; /* I8, DXT1, DXT3, DXT5 */
-    return tex_kind(t->format) == TK_2D ? find_target(t->addr, 0) : NULL;
+    Target *rt = tex_kind(t->format) == TK_2D ? find_target(t->addr, 0) : NULL;
+    /* a target read back hands its memory to the game: once the game writes something else there, that is the
+     * texture (#28: a race's car status box showed a car's icon, read back earlier where its picture now is) */
+    if (rt && rt->mem_valid && rt->mem_checked != g_frame) {
+        rt->mem_checked = g_frame;
+        if (hash_bytes(g_mem + rt->addr, rt->mem_size, 0) != rt->mem_hash) {
+            rt->mem_valid = 0, rt->rewritten = 1;
+            fprintf(stderr, "[render] target %08X: the game wrote over it since it was read back; textures read that"
+                    " (format %08X, rect %08X)\n", rt->addr, t->format, t->rect);
+        }
+    }
+    return rt && !rt->rewritten ? rt : NULL;
 }
 
 /* host view for texture unit `t`; *scale gets the coordinate scale for unnormalised (rect) textures */
@@ -1208,7 +1351,10 @@ void render_anisotropy(int n) { /* other threads' way in: with the GPU lock */
 static ID3D11SamplerState *sampler(const TexDesc *t) {
     /* ADDRESS: u [3:0], v [11:8], p [19:16] (1 wrap, 2 mirror, 3 clamp-to-edge, 4 border, 5 clamp); FILTER: min [23:16],
      * mag [27:24] */
-    uint64_t key = (uint64_t)t->address << 32 ^ (t->filter & 0x0FFF0000);
+    /* the border colour is part of it: without it, the night tracks' headlights (a volume clamped to a black border)
+     * took the sampler of an earlier texture with the same address and filter but a light border, and lit the road
+     * white wherever their beam was not (#24) */
+    uint64_t key = hash_bytes((uint32_t[]){t->address, t->filter & 0x0FFF0000, t->border}, 12, 0) & ~(1ull << 62);
     ID3D11SamplerState *s = cached_state(2, key | 1ull << 62); /* shares the raster table, distinct key space */
     if (s) return s;
     static const D3D11_TEXTURE_ADDRESS_MODE modes[8] = {D3D11_TEXTURE_ADDRESS_WRAP, D3D11_TEXTURE_ADDRESS_WRAP,
@@ -1446,6 +1592,7 @@ static float ui_squeeze(const Draw *d, const Target *color, int rt_read, int *al
     const Surface *s = &d->surf;
     *all = 0;
     if (!color->wide) return 1;
+    if (g_k[KM(0x030C)]) g_wide3d_frame = g_frame; /* MENU SIDES: this frame has 3D across the screen */
     if (g_k[KM(0x030C)]) { /* the depth test on: 3D, as wide as the screen, but for a race's view of its own in part
                             * of the width, the rear-view mirror: its camera is not widened (hle_forza.c), so it is
                             * squeezed whole to its 16:9 shape, else its cars came out twice as wide at 32:9. Only
@@ -1550,6 +1697,25 @@ void render_draw(const Draw *d) {
     const Surface *s = &d->surf;
     Target *color = target(s->color_addr, s->width, s->height, 0);
     Target *depth = s->zeta_addr ? target(s->zeta_addr, s->width, s->height, 1) : NULL;
+    if (depth && depth->w == s->width && depth->h == s->height && (color->w > s->width || color->h > s->height)) {
+        /* D3D draws nothing when the two differ in size, and the colour target kept the size of a bigger surface that
+         * used its address before (targets only grow): it is made this surface's size again, in its slot (#26: a car's
+         * new icon came out grey, with no car). A screen drawn with the anti-aliased depth (twice as wide) is the
+         * game's own and stays as it was */
+        fprintf(stderr, "[render] target %08X made %ux%u again (it had kept %ux%u)\n", s->color_addr, s->width, s->height,
+                color->w, color->h);
+        ID3D11Texture2D *old = color->tex; /* what was drawn so far (the icon's background), its corner kept */
+        UINT old_hw = color->hw;
+        uint32_t old_w = color->w;
+        ID3D11Texture2D_AddRef(old);
+        color->w = color->h = 0;
+        color = target(s->color_addr, s->width, s->height, 0);
+        if ((uint64_t)old_hw * color->w == (uint64_t)color->hw * old_w) { /* the same host pixels per guest pixel */
+            D3D11_BOX b = {0, 0, 0, color->hw, color->hh, 1};
+            ID3D11DeviceContext1_CopySubresourceRegion(g_ctx, (ID3D11Resource *)color->tex, 0, 0, 0, 0, (ID3D11Resource *)old, 0, &b);
+        }
+        ID3D11Texture2D_Release(old);
+    }
 
     int mv = g_mv_on && !g_supersampled && depth && g_k[KM(0x030C)] && s->width / s->aa_x >= g_present_w && s->height / s->aa_y >= g_present_h;
 
@@ -1568,6 +1734,7 @@ void render_draw(const Draw *d) {
         *ps = shader(src, 1, wait);
     } else if (IS_PENDING(*ps)) *ps = finished(*ps, wait);
     if (IS_PENDING(*vs) || IS_PENDING(*ps)) return;
+    color->sw = s->width, color->sh = s->height, color->mem_valid = color->rewritten = 0; /* its picture is on the host again */
 
     /* constants */
     static Constants k;
@@ -1619,8 +1786,10 @@ void render_draw(const Draw *d) {
             snapshot_scene(color->addr);
             break;
         }
-    for (int t = 0; t < 4; t++) /* a target cannot be bound for reading and writing at once */
-        if (srv[t] == color->srv || (depth && srv[t] == depth->srv)) {
+    for (int t = 0; t < 4; t++) /* a target cannot be bound for reading and writing at once: a colour target is read
+                                 * from a copy (the paint jobs draw over what they read, #28), a depth one not at all */
+        if (srv[t] == color->srv) srv[t] = target_copy(color);
+        else if (depth && srv[t] == depth->srv) {
             static int warned;
             if (!warned++) fprintf(stderr, "[render] draw samples its own render target; unit unbound\n");
             srv[t] = dummy(tex_kind(d->tex[t].format));
@@ -1808,7 +1977,8 @@ draw:;
     ID3D11RenderTargetView_Release(rtv);
 }
 
-/* SCREENSHOT=<n>: write the n-th presented frame to build/frame.bmp, and every colour target to build/rt_*.bmp */
+/* SCREENSHOT=<n>: write the n-th presented frame to build/frame.bmp, and every colour target to build/rt_*.bmp (as
+ * does creating build/targets.now, any time) */
 static void screenshot(ID3D11Texture2D *tex, const char *path) {
     D3D11_TEXTURE2D_DESC td;
     ID3D11Texture2D_GetDesc(tex, &td);
@@ -1845,12 +2015,12 @@ static ID3D11PixelShader *pixel_shader(const char *src) {
 }
 
 /* draw a triangle covering `vp` of `rtv` (uv 0..1 across it) with pixel shader `ps` reading `src`; `cb` (16 floats)
- * goes to b0; `over`: blend premultiplied alpha over what is there */
+ * goes to b0; `over`: 1 blend premultiplied alpha over what is there, 2 keep the brighter of the two (each channel) */
 static void pass(ID3D11RenderTargetView *rtv, const D3D11_VIEWPORT *vp, ID3D11PixelShader *ps,
                  ID3D11ShaderResourceView *src, const float *cb, int over) {
     static ID3D11VertexShader *vs;
     static ID3D11SamplerState *smp;
-    static ID3D11BlendState *premul;
+    static ID3D11BlendState *premul, *lighten;
     static ID3D11Buffer *cbuf;
     static UINT cbuf_size;
     if (!vs) {
@@ -1868,13 +2038,17 @@ static void pass(ID3D11RenderTargetView *rtv, const D3D11_VIEWPORT *vp, ID3D11Pi
                                                             D3D11_BLEND_ONE, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_OP_ADD,
                                                             D3D11_COLOR_WRITE_ENABLE_ALL};
         ID3D11Device_CreateBlendState(g_dev, &d, &premul);
+        d.RenderTarget[0] = (D3D11_RENDER_TARGET_BLEND_DESC){TRUE, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_MAX,
+                                                            D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_OP_MAX,
+                                                            D3D11_COLOR_WRITE_ENABLE_ALL};
+        ID3D11Device_CreateBlendState(g_dev, &d, &lighten);
     }
     if (cb) {
         upload(&cbuf, &cbuf_size, D3D11_BIND_CONSTANT_BUFFER, cb, 16 * sizeof(float));
         ID3D11DeviceContext1_PSSetConstantBuffers(g_ctx, 0, 1, &cbuf);
     }
     ID3D11DeviceContext1_OMSetRenderTargets(g_ctx, 1, &rtv, NULL);
-    ID3D11DeviceContext1_OMSetBlendState(g_ctx, over ? premul : NULL, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext1_OMSetBlendState(g_ctx, over == 2 ? lighten : over ? premul : NULL, NULL, 0xFFFFFFFF);
     ID3D11DeviceContext1_OMSetDepthStencilState(g_ctx, NULL, 0);
     ID3D11DeviceContext1_RSSetState(g_ctx, NULL);
     ID3D11DeviceContext1_RSSetViewports(g_ctx, 1, vp);
@@ -1959,6 +2133,53 @@ static void surf(Surf *s, UINT w, UINT h, DXGI_FORMAT f, UINT bind) {
 static void pass(ID3D11RenderTargetView *rtv, const D3D11_VIEWPORT *vp, ID3D11PixelShader *ps,
                  ID3D11ShaderResourceView *src, const float *cb, int over);
 static void blit(ID3D11Texture2D *dst, const D3D11_VIEWPORT *vp, ID3D11ShaderResourceView *src, int over);
+
+/* MENU SIDES (ULTRAWIDE): a 2D screen's sides, which it leaves black (its 640 columns go into the middle 16:9), filled
+ * from its own picture: the middle shrunk to an eighth (a 4x4 grid of bilinear taps each) and blurred there (9 taps
+ * across, 5 down: the menus' black bands stay put), then each side the middle's edge mirrored outwards and stretched
+ * (a side's outer edge shows a sixteenth of the way in: further in, a title or line of text came out as streaks), one
+ * tap a pixel, darker outwards. Kept only where it is brighter than what is there, so the full-width bars and rules the
+ * game draws over the sides stay. Not with a 3D scene across the screen (the showroom, the grid, a race and its pause
+ * menu), whose sides are its own. */
+static int g_menu_sides = -1;  /* recomp.ini menusides: 1 filled, 0 black */
+void render_menusides(int on) { g_menu_sides = on; }
+
+static void menu_sides(ID3D11Texture2D *frame, ID3D11ShaderResourceView *frame_srv, UINT w, UINT h) {
+    static ID3D11PixelShader *shrink, *blur, *fill;
+    static Surf low, soft;
+    if (!shrink) {
+        shrink = pixel_shader("Texture2D t : register(t0); SamplerState s : register(s0); cbuffer c : register(b0) { float4 a; };"
+                              " float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {"
+                              " float2 p = float2(a.x + uv.x * a.y, uv.y); float4 sum = 0;"
+                              " [unroll] for (int y = 0; y < 4; y++) [unroll] for (int x = 0; x < 4; x++)"
+                              " sum += t.SampleLevel(s, p + (float2(x, y) - 1.5) * a.zw, 0); return sum / 16; }");
+        blur = pixel_shader("Texture2D t : register(t0); SamplerState s : register(s0); cbuffer c : register(b0) { float4 a; };"
+                            " float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { float4 sum = 0;"
+                            " [unroll] for (int i = -4; i <= 4; i++) [unroll] for (int j = -2; j <= 2; j++)"
+                            " sum += t.SampleLevel(s, uv + float2(i * 1.5, j) * a.xy, 0); return sum / 45; }");
+        fill = pixel_shader("Texture2D t : register(t0); SamplerState s : register(s0); cbuffer c : register(b0) { float4 a; };"
+                            " float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {"
+                            " float m0 = a.x, mw = a.y, d = pos.x < m0 ? m0 - pos.x : pos.x - (m0 + mw);"
+                            " float u = d / (16 * m0); u = pos.x < m0 ? u : 1 - u;"
+                            " float4 c = t.SampleLevel(s, float2(u, pos.y / a.z), 0);"
+                            " return float4(c.rgb * lerp(0.6, 0.2, saturate(d / m0)), 1); }");
+    }
+    UINT mw = (UINT)(w / g_widen + 0.5f), m0 = (w - mw) / 2;
+    surf(&low, mw / 8 ? mw / 8 : 1, h / 8 ? h / 8 : 1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_RENDER_TARGET);
+    surf(&soft, low.w, low.h, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_RENDER_TARGET);
+    if (!low.rtv || !soft.rtv || m0 < 1) return;
+    D3D11_VIEWPORT sv = {0, 0, (float)low.w, (float)low.h, 0, 1};
+    float cs[16] = {(float)m0 / w, (float)mw / w, 2.0f / w, 2.0f / h}, cb[16] = {1.0f / low.w, 1.0f / low.h};
+    pass(low.rtv, &sv, shrink, frame_srv, cs, 0);
+    pass(soft.rtv, &sv, blur, low.srv, cb, 0);
+    ID3D11RenderTargetView *rtv;
+    if (FAILED(ID3D11Device_CreateRenderTargetView(g_dev, (ID3D11Resource *)frame, NULL, &rtv))) return;
+    float cf[16] = {(float)m0, (float)mw, (float)h};
+    D3D11_VIEWPORT left = {0, 0, (float)m0, (float)h, 0, 1}, right = {(float)(m0 + mw), 0, (float)(w - m0 - mw), (float)h, 0, 1};
+    pass(rtv, &left, fill, soft.srv, cf, 2);
+    pass(rtv, &right, fill, soft.srv, cf, 2);
+    ID3D11RenderTargetView_Release(rtv);
+}
 
 /* the frame `composed` (w x h) rebuilt by DLSS or FSR 3 from its scene's motion and depth (snap) into `back`'s
  * rectangle vp; 0 when it cannot (the caller scales it as before). Never smaller than the input: a frame larger than
@@ -2165,9 +2386,10 @@ static void version_text(ID3D11Texture2D *back, UINT sw, UINT sh) {
     if (srv) blit(back, &vp, srv, 1);
 }
 
-/* an achievement just earned (achieve.c): a dark panel at the top middle with the emblem (the exe's icon), ACHIEVEMENT
- * UNLOCKED, the name and how it was earned; it slides down in 0.3 s, stays 4 s and slides back up, one at a time.
- * Drawn with GDI into a texture (premultiplied), as version_text. */
+/* an achievement just earned (achieve.c), at the bottom middle as the Xbox 360 showed them, in our colours: a red ring
+ * with the emblem (the exe's icon) pops up, a dark bar opens out of it with "Achievement unlocked" over the name, and
+ * after 4 s it closes back and the ring shrinks away; our own chime (audio.c) with it; one at a time. The emblem and
+ * text are drawn with GDI into a texture, the shapes by a pixel shader. */
 static void toast_text(HDC dc, uint32_t *cov, int w, int h, float *px, int x, int y, int size, int weight, const char *s,
                        float r, float g, float b) {
     HFONT font = CreateFontA(-size, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
@@ -2185,62 +2407,83 @@ static void toast_text(HDC dc, uint32_t *cov, int w, int h, float *px, int x, in
 }
 
 static void achieve_toast(ID3D11Texture2D *back, UINT sw, UINT sh) {
+    static ID3D11PixelShader *ps;
     static ID3D11ShaderResourceView *srv;
     static UINT for_h, tw, th;
     static int shown = -1;
     static ULONGLONG start;
+    if (!ps) /* the bar a pill from the circle's centre to its open end, the text in it, the circle and emblem over it;
+              * premultiplied. a: width, height, how open (0-1), the circle's scale; b.x: the text's opacity */
+        ps = pixel_shader(
+            "Texture2D t : register(t0); SamplerState s : register(s0); cbuffer c : register(b0) { float4 a; float4 b; };"
+            " float cover(float d) { return saturate(0.5 - d); }"
+            " float4 over(float4 top, float4 under) { return top + under * (1 - top.a); }"
+            " float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {"
+            " float W = a.x, H = a.y, r = H * 0.5, rb = r * 0.8, xe = r + a.z * (W - 2 * r); float2 p = uv * float2(W, H);"
+            " float db = length(p - float2(clamp(p.x, r, xe), r)) - rb, bar = a.z > 0 ? cover(db) : 0;"
+            " float rim = cover(abs(db + 1.5) - 1.5);"
+            " float4 col = float4(float3(0.06, 0.045, 0.05) + rim * float3(0.10, 0.08, 0.08), 1) * bar * 0.93;"
+            " float4 text = p.x > H ? t.Sample(s, uv) * b.x * cover(p.x - (xe + rb * 0.4)) * bar : 0;"
+            " col = over(text, col);"
+            " float2 c = float2(r, r); float rc = r * a.w, dc = length(p - c) - rc, ring = rc * 0.13;"
+            " float disc = cover(dc), inner = cover(dc + ring);"
+            " float4 circle = float4(float3(0.89, 0.15, 0.18) * (disc - inner) + float3(0.07, 0.05, 0.06) * inner, disc);"
+            " float4 icon = a.w > 0.01 ? t.Sample(s, (c + (p - c) / a.w) / float2(W, H)) * inner : 0;"
+            " return over(over(icon, circle), col); }");
     ULONGLONG now = GetTickCount64();
-    if (shown >= 0 && now - start > 4600) shown = -1;
+    if (shown >= 0 && now - start > 5000) shown = -1;
     if (shown < 0) {
         if (srv) ID3D11ShaderResourceView_Release(srv), srv = NULL;
         if ((shown = achieve_toast_next()) < 0) return;
         start = now, for_h = 0;
+        audio_chime();
     }
-    if (!srv || for_h != sh) {
+    if (!srv || for_h != sh) { /* the emblem in the circle's place, the two lines of text right of it */
         if (srv) ID3D11ShaderResourceView_Release(srv), srv = NULL;
         for_h = sh;
-        int h = sh / 9 < 72 ? 72 : (int)sh / 9, w = h * 9 / 2, pad = h / 6, icon = h - 2 * pad;
+        int h = sh / 12 < 56 ? 56 : (int)sh / 12, icon = h * 56 / 100, tx = h + h / 8;
+        HDC dc = CreateCompatibleDC(NULL);
+        static const char label[] = "Achievement unlocked";
+        int need = h * 2; /* as wide as the label and the name need */
+        for (int k = 0; k < 2; k++) {
+            HFONT font = CreateFontA(k ? -(h / 3) : -(h * 22 / 100), 0, 0, 0, k ? FW_BOLD : FW_SEMIBOLD, 0, 0, 0,
+                                     DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
+            HGDIOBJ of = SelectObject(dc, font);
+            const char *s = k ? achieve_name(shown) : label;
+            SIZE ext = {0};
+            GetTextExtentPoint32A(dc, s, (int)strlen(s), &ext);
+            SelectObject(dc, of), DeleteObject(font);
+            if (ext.cx > need) need = ext.cx;
+        }
+        int w = tx + need + h / 2;
         tw = w, th = h;
         float *px = calloc((size_t)w * h, 16);
-        for (int y = 0; y < h; y++) /* the panel: near black, 90%, corners rounded by pad / 2; a red edge on the left */
-            for (int x = 0; x < w; x++) {
-                int rr = pad / 2, cx = x < rr ? rr - x : x >= w - rr ? x - (w - rr - 1) : 0,
-                    cy = y < rr ? rr - y : y >= h - rr ? y - (h - rr - 1) : 0;
-                if (cx * cx + cy * cy > rr * rr) continue;
-                float *p = px + 4 * (y * w + x);
-                int edge = x < h / 18 + 1;
-                p[0] = edge ? 0.86f : 0.07f, p[1] = edge ? 0.12f : 0.07f, p[2] = edge ? 0.15f : 0.08f, p[3] = 0.9f;
-            }
         HICON ico = (HICON)LoadImageA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(1), IMAGE_ICON, icon, icon, 0);
         ICONINFO ii;
-        if (ico && GetIconInfo(ico, &ii)) { /* the emblem's 32-bit colour, straight alpha, over the panel */
-            BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), icon, -icon, 1, 32, BI_RGB}};
+        if (ico && GetIconInfo(ico, &ii)) { /* the emblem's 32-bit colour, straight alpha */
+            BITMAPINFO ib_i = {{sizeof(BITMAPINFOHEADER), icon, -icon, 1, 32, BI_RGB}};
             uint32_t *ib = malloc((size_t)icon * icon * 4);
             HDC sdc = GetDC(NULL);
-            if (ii.hbmColor && GetDIBits(sdc, ii.hbmColor, 0, icon, ib, &bi, DIB_RGB_COLORS))
+            int o = (h - icon) / 2;
+            if (ii.hbmColor && GetDIBits(sdc, ii.hbmColor, 0, icon, ib, &ib_i, DIB_RGB_COLORS))
                 for (int y = 0; y < icon; y++)
                     for (int x = 0; x < icon; x++) {
                         uint32_t v = ib[y * icon + x];
-                        float a = (v >> 24) / 255.0f, *p = px + 4 * ((y + pad) * w + x + pad + h / 18 + 2);
-                        p[0] = p[0] * (1 - a) + ((v >> 16) & 0xFF) / 255.0f * a;
-                        p[1] = p[1] * (1 - a) + ((v >> 8) & 0xFF) / 255.0f * a;
-                        p[2] = p[2] * (1 - a) + (v & 0xFF) / 255.0f * a, p[3] = p[3] + a * (1 - p[3]);
+                        float a = (v >> 24) / 255.0f, *p = px + 4 * ((y + o) * w + x + o);
+                        p[0] = ((v >> 16) & 0xFF) / 255.0f, p[1] = ((v >> 8) & 0xFF) / 255.0f, p[2] = (v & 0xFF) / 255.0f;
+                        p[3] = a;
                     }
             ReleaseDC(NULL, sdc), free(ib);
             if (ii.hbmColor) DeleteObject(ii.hbmColor);
             if (ii.hbmMask) DeleteObject(ii.hbmMask);
         }
         if (ico) DestroyIcon(ico);
-        HDC dc = CreateCompatibleDC(NULL);
         BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB}};
         uint32_t *cov;
         HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&cov, NULL, 0);
         HGDIOBJ old_bm = SelectObject(dc, bm);
-        int tx = pad + h / 18 + 2 + icon + pad;
-        toast_text(dc, cov, w, h, px, tx, pad * 3 / 4, h / 6, FW_BOLD, "ACHIEVEMENT UNLOCKED", 0.95f, 0.25f, 0.27f);
-        toast_text(dc, cov, w, h, px, tx, pad * 3 / 4 + h / 5, h * 2 / 7, FW_BOLD, achieve_name(shown), 1, 1, 1);
-        toast_text(dc, cov, w, h, px, tx, pad * 3 / 4 + h / 5 + h * 3 / 10, h / 6, FW_NORMAL, achieve_desc(shown), 0.75f,
-                   0.75f, 0.78f);
+        toast_text(dc, cov, w, h, px, tx, h * 15 / 100, h * 22 / 100, FW_SEMIBOLD, label, 0.68f, 0.62f, 0.63f);
+        toast_text(dc, cov, w, h, px, tx, h * 40 / 100, h / 3, FW_BOLD, achieve_name(shown), 1, 1, 1);
         SelectObject(dc, old_bm), DeleteObject(bm), DeleteDC(dc);
         uint32_t *out = malloc((size_t)w * h * 4);
         for (int i = 0; i < w * h; i++) { /* premultiplied BGRA */
@@ -2258,10 +2501,19 @@ static void achieve_toast(ID3D11Texture2D *back, UINT sw, UINT sh) {
             ID3D11Device_CreateShaderResourceView(g_dev, (ID3D11Resource *)t, NULL, &srv), ID3D11Texture2D_Release(t);
         free(out);
     }
-    float t = (now - start) / 1000.0f, in = t < 0.3f ? t / 0.3f : t > 4.3f ? (4.6f - t) / 0.3f : 1;
-    in = in < 0 ? 0 : in * in * (3 - 2 * in); /* eased */
-    D3D11_VIEWPORT vp = {(float)(sw - tw) / 2, -(float)th + in * (th + th / 5.0f), (float)tw, (float)th, 0, 1};
-    if (srv) blit(back, &vp, srv, 1);
+    /* the circle pops up (0-0.25 s, a little past full size and back), the bar opens out of it (0.2-0.55 s) and the
+     * text fades in; from 4.3 s the same backwards */
+    float t = (now - start) / 1000.0f, k;
+#define RAMP(t0, t1) ((k = ((t) - (t0)) / ((t1) - (t0))) < 0 ? 0 : k > 1 ? 1 : k)
+    float pop = RAMP(0, 0.25f), shrink = RAMP(4.65f, 4.9f), open_ = RAMP(0.2f, 0.55f) - RAMP(4.35f, 4.7f);
+    float scale = (1 + 2.2f * (pop - 1) * (pop - 1) * (pop - 1) + 1.2f * (pop - 1) * (pop - 1)) * (1 - shrink * shrink);
+    float cb[16] = {(float)tw, (float)th, 1 - (1 - open_) * (1 - open_) * (1 - open_), scale,
+                    RAMP(0.45f, 0.7f) - RAMP(4.25f, 4.45f)};
+#undef RAMP
+    D3D11_VIEWPORT vp = {(float)(sw - tw) / 2, (float)sh - th - sh * 0.07f, (float)tw, (float)th, 0, 1};
+    ID3D11RenderTargetView *rtv;
+    if (srv && SUCCEEDED(ID3D11Device_CreateRenderTargetView(g_dev, (ID3D11Resource *)back, NULL, &rtv)))
+        pass(rtv, &vp, ps, srv, cb, 1), ID3D11RenderTargetView_Release(rtv);
 }
 
 /* The CRTC now scans out the framebuffer at guest address `addr`: show its host target. The frame (640x480, or the
@@ -2272,6 +2524,89 @@ static uint32_t g_shown, g_new; /* frames that reached the window, and new game 
 
 /* A new game frame came more than 50 ms after the last (three frames late at 60): always logged, with what happened
  * in between, so the log of any session says what its stutters were. Not more than one line a second. */
+/* HITCHLOG=1: after each hitch line, the threads that ran most in its gap and their CPU ms (thread_name's names):
+ * whether the game's own thread was busy or other threads had the cores. The threads are listed every 2 s and
+ * their CPU times read at each frame */
+static void hitch_threads(int report, double gap) {
+    enum { MAXT = 128 };
+    static HANDLE h[MAXT];
+    static DWORD tid[MAXT];
+    static ULONGLONG cpu[MAXT];
+    static int n, frames;
+    if (frames++ % 288 == 0) { /* the threads again: new ones started, old ones ended */
+        HANDLE nh[MAXT];
+        DWORD ntid[MAXT];
+        ULONGLONG ncpu[MAXT];
+        int m = 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 te = {sizeof te};
+        for (BOOL ok = Thread32First(snap, &te); ok && m < MAXT; ok = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+            HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+            if (!t) continue;
+            ncpu[m] = 0;
+            for (int i = 0; i < n; i++)
+                if (tid[i] == te.th32ThreadID) ncpu[m] = cpu[i]; /* its time so far, for this frame's difference */
+            nh[m] = t, ntid[m++] = te.th32ThreadID;
+        }
+        CloseHandle(snap);
+        for (int i = 0; i < n; i++) CloseHandle(h[i]);
+        memcpy(h, nh, m * sizeof *h), memcpy(tid, ntid, m * sizeof *tid), memcpy(cpu, ncpu, m * sizeof *cpu), n = m;
+    }
+    static HRESULT(WINAPI * get)(HANDLE, PWSTR *);
+    if (!get) get = (HRESULT(WINAPI *)(HANDLE, PWSTR *))(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+    /* cycles (QueryThreadCycleTime: exact, where GetThreadTimes counts in 15.6 ms ticks) to ms, by the TSC's rate
+     * measured against the performance counter since the first frame */
+    static ULONGLONG tsc0;
+    static LARGE_INTEGER q0, qf;
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    if (!tsc0) tsc0 = __rdtsc(), q0 = q, QueryPerformanceFrequency(&qf);
+    double secs = (double)(q.QuadPart - q0.QuadPart) / qf.QuadPart, per_ms = secs > 0.5 ? (__rdtsc() - tsc0) / secs / 1000 : 4e6;
+    double ms[MAXT];
+    for (int i = 0; i < n; i++) {
+        ULONG64 now = cpu[i];
+        QueryThreadCycleTime(h[i], &now);
+        ms[i] = cpu[i] ? (now - cpu[i]) / per_ms : 0, cpu[i] = now;
+    }
+    if (!report) return;
+    fprintf(stderr, "[hitch]   CPU in those %.0f ms:", gap);
+    for (int shown = 0; shown < 8; shown++) { /* the busiest, down to 2 ms */
+        int best = -1;
+        for (int i = 0; i < n; i++)
+            if (ms[i] >= 2 && (best < 0 || ms[i] > ms[best])) best = i;
+        if (best < 0) break;
+        PWSTR name = NULL;
+        if (get && SUCCEEDED(get(h[best], &name)) && name && *name) fprintf(stderr, " %ls %.0f,", name, ms[best]);
+        else fprintf(stderr, " thread %lu %.0f,", tid[best], ms[best]);
+        if (name) LocalFree(name);
+        ms[best] = 0;
+    }
+    fprintf(stderr, "\n");
+}
+
+static volatile LONG64 g_last_frame_qpc; /* HITCHLOG's stall watcher: when the last new frame came */
+static DWORD WINAPI stall_watch(void *p) { /* HITCHLOG: a race 35 ms without a new frame: where the guest threads are */
+    (void)p;
+    thread_name("stall watch");
+    LARGE_INTEGER hz;
+    QueryPerformanceFrequency(&hz);
+    LONG64 dumped = 0;
+    for (;;) {
+        Sleep(5);
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        LONG64 last = g_last_frame_qpc;
+        if (!last || last == dumped || !forza_racing() || (now.QuadPart - last) * 1000 / hz.QuadPart < 35) continue;
+        dumped = last;
+        fprintf(stderr, "[stall] %lld ms without a frame so far:\n", (long long)((now.QuadPart - last) * 1000 / hz.QuadPart));
+        guest_threads_report("stall");
+        nv2a_brief();
+        static const char *const names[] = {"gpu", "texture pack", "shader"};
+        profile_stacks(names, 3);
+    }
+}
+
 static void hitch_check(void) {
     static LARGE_INTEGER hz, last, logged;
     static uint32_t compiles, uploads, targets, loads, evictions;
@@ -2283,6 +2618,9 @@ static void hitch_check(void) {
     int queued;
     texpack_stats(&tl, &te, &queued);
     double gap = last.QuadPart ? (now.QuadPart - last.QuadPart) * 1000.0 / hz.QuadPart : 0;
+    static int hitchlog = -1;
+    if (hitchlog < 0 && (hitchlog = getenv("HITCHLOG") != NULL)) CloseHandle(CreateThread(NULL, 0, stall_watch, NULL, 0, NULL));
+    g_last_frame_qpc = now.QuadPart;
     if (gap > 50 && (now.QuadPart - logged.QuadPart) > hz.QuadPart) {
         fprintf(stderr, "[hitch] %.0f ms between frames on %s: %u shaders compiled, %u textures decoded (%.1f ms), %u "
                 "render targets made, texture pack %u loaded / %u dropped (%d waiting)\n", gap,
@@ -2290,7 +2628,8 @@ static void hitch_check(void) {
                 (g_tex_ticks - tex_ticks) * 1000.0 / hz.QuadPart, g_targets_made - targets, tl - loads, te - evictions,
                 queued);
         logged = now;
-    }
+        if (hitchlog) hitch_threads(1, gap);
+    } else if (hitchlog) hitch_threads(0, 0);
     last = now, compiles = g_compiles_made, uploads = g_tex_uploads, targets = g_targets_made, loads = tl,
     evictions = te, tex_ticks = g_tex_ticks;
 }
@@ -2342,6 +2681,9 @@ static void present(uint32_t addr) {
                                                    (ID3D11Resource *)t->tex, 0, &box);
     }
     composite_overlay(composed, t ? t->srv : NULL);
+    if (g_menu_sides < 0) g_menu_sides = cfg_get("MENUSIDES", "menusides", 1);
+    if (g_widen > 1 && g_menu_sides && g_frame - g_wide3d_frame > 8 && !forza_race_view())
+        menu_sides(composed, composed_srv, w, h);
     ID3D11RenderTargetView *back_rtv;
     if (SUCCEEDED(ID3D11Device_CreateRenderTargetView(g_dev, (ID3D11Resource *)back, NULL, &back_rtv))) {
         static const float black[4] = {0, 0, 0, 1}; /* the bars around the picture */
@@ -2370,7 +2712,7 @@ static void present(uint32_t addr) {
     else downsample(back, &vp, composed_srv, w, h);
     version_text(back, sw, sh);
     achieve_toast(back, sw, sh);
-    if (t && frame++ == shot) {
+    if (t && (frame++ == shot || DeleteFileA("build/targets.now"))) { /* or once build/targets.now is created */
         screenshot(back, "build/frame.bmp");
         for (int i = 0; i < MAX_TARGETS; i++)
             if (g_targets[i].tex && !g_targets[i].depth) {
@@ -2415,6 +2757,25 @@ void render_present(uint32_t addr) {
     present(addr);
     QueryPerformanceCounter(&end);
     busy += (end.QuadPart - start.QuadPart) * 1000.0 / f.QuadPart;
+    /* what the screen made of the presents: a refresh that showed the last one again (repeated), or a present replaced
+     * before any refresh showed it (dropped). Each present on a refresh of its own is neither. */
+    static DXGI_FRAME_STATISTICS was;
+    static int repeated, dropped, phase[8];
+    double vb, real;
+    if (display_vblank(&vb, &real)) { /* where in the refresh the present came, eighths after the screen's vblank */
+        double ph = fmod(start.QuadPart * 1000.0 / f.QuadPart - vb, real) / real;
+        phase[(int)((ph < 0 ? ph + 1 : ph) * 8) & 7]++;
+    }
+    DXGI_FRAME_STATISTICS st;
+    if (SUCCEEDED(IDXGISwapChain1_GetFrameStatistics(g_swap, &st))) {
+        if (was.PresentCount && st.PresentCount != was.PresentCount) {
+            int dp = (int)(st.PresentCount - was.PresentCount), dr = (int)(st.PresentRefreshCount - was.PresentRefreshCount);
+            if (dp < 0 || dr < 0 || dr > 1000) { /* the window went to another screen: its own refresh count */
+            } else if (dr > dp) repeated += dr - dp;
+            else dropped += dp - dr;
+        }
+        was = st;
+    }
     if (last.QuadPart) {
         double ms = (start.QuadPart - last.QuadPart) * 1000.0 / f.QuadPart;
         if (ms > worst) worst = ms;
@@ -2430,10 +2791,13 @@ void render_present(uint32_t addr) {
         static uint32_t uploads0;
         int64_t push = nv2a_push_ticks();
         fprintf(stderr, "[fps] %.1f presents/s (%.1f shown, %.1f new), %.1f ms apart (worst %.1f, %d over 20 ms), %.2f ms presenting, "
-                "%.2f ms of push buffer (%.2f ms hashing %.1f MB of textures, %u decoded); %d shaders compiled in %.0f ms\n",
+                "%.2f ms of push buffer (%.2f ms hashing %.1f MB of textures, %u decoded); %d shaders compiled in %.0f ms; "
+                "screen: %d refreshes repeated, %d presents dropped, phase %d %d %d %d %d %d %d %d\n",
                 n * 1000.0 / span, g_shown * 1000.0 / span, g_new * 1000.0 / span, span / n, worst, slow, busy / n,
                 (push - push0) * 1000.0 / f.QuadPart / n, g_hash_ticks * 1000.0 / f.QuadPart / n, g_hash_bytes / 1e6 / n,
-                g_tex_uploads - uploads0, (int)g_compiles, g_compile_ticks * 1000.0 / f.QuadPart);
+                g_tex_uploads - uploads0, (int)g_compiles, g_compile_ticks * 1000.0 / f.QuadPart, repeated, dropped,
+                phase[0], phase[1], phase[2], phase[3], phase[4], phase[5], phase[6], phase[7]);
+        repeated = dropped = 0, memset(phase, 0, sizeof phase);
         n = slow = 0, worst = busy = 0, t0 = start, push0 = push, g_hash_ticks = g_hash_bytes = 0, g_shown = g_new = 0;
         uploads0 = g_tex_uploads;
         g_compiles = 0, g_compile_ticks = 0;

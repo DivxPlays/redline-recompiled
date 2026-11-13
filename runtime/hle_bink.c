@@ -43,7 +43,7 @@ void hle_BinkWrapperOpen(X86Ctx *c) {
     /* Flags 1 opens a video at the game's own frame rate (refresh / vblanks per frame): the event list's track
      * flythroughs (Flythrough.bik, 29.97 fps), a frame per game frame, 30 on the Xbox (60 / 2). Above 30 that rate
      * is 72-144 and they ran 2.4-4.8x fast: they get their file's own rate back (BIK header +28 / +32). */
-    if (!fps) fps = cfg_get("FRAMERATE", "framerate", 60);
+    if (!fps) fps = forza_fps();
     if (bink && (flags & 1) && fps > 30 && n[0] && n[1] == ':') {
         char p[512];
         uint32_t h[9];

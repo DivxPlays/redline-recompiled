@@ -43,19 +43,24 @@ FOURCC = {"DXT1": b"DXT1", "DXT3": b"DXT3", "DXT5": b"DXT5"}
 
 
 def hash_dll():
-    """build/texhash.dll from tools/texhash.c, with the MSVC environment tools/build.py uses"""
+    """build/texhash.dll from tools/texhash.c: with the launcher's zig when it is there (players have no Visual
+    Studio), else with the MSVC environment tools/build.py uses"""
     dll = os.path.join(ROOT, "build", "texhash.dll")
     src = os.path.join(ROOT, "tools", "texhash.c")
     if not os.path.exists(dll) or os.path.getmtime(dll) < max(os.path.getmtime(src),
                                                                os.path.getmtime(os.path.join(ROOT, "runtime", "pgraph.h"))):
         sys.path.insert(0, os.path.join(ROOT, "tools"))
         import build
-        env = build.msvc_env()
-        cl = shutil.which("cl", path=env.get("PATH") or env.get("Path"))
-        os.makedirs(os.path.join(ROOT, "build", "texhash"), exist_ok=True)
-        r = subprocess.run([cl, "/nologo", "/O2", "/LD", "/Iruntime", "/Fobuild\\texhash\\", "tools\\texhash.c",
-                            "/link", "/out:build\\texhash.dll", "/implib:build\\texhash\\texhash.lib"],
-                           cwd=ROOT, env=env, capture_output=True, text=True)
+        if os.path.exists(build.ZIG):
+            r = subprocess.run([build.ZIG, "cc", "-target", "x86_64-windows-gnu", "-shared", "-O2", "-Iruntime",
+                                "-o", "build\\texhash.dll", "tools\\texhash.c"], cwd=ROOT, capture_output=True, text=True)
+        else:
+            env = build.msvc_env()
+            cl = shutil.which("cl", path=env.get("PATH") or env.get("Path"))
+            os.makedirs(os.path.join(ROOT, "build", "texhash"), exist_ok=True)
+            r = subprocess.run([cl, "/nologo", "/O2", "/LD", "/Iruntime", "/Fobuild\\texhash\\", "tools\\texhash.c",
+                                "/link", "/out:build\\texhash.dll", "/implib:build\\texhash\\texhash.lib"],
+                               cwd=ROOT, env=env, capture_output=True, text=True)
         if r.returncode:
             sys.exit("texhash.dll did not build:\n" + r.stdout + r.stderr)
     lib = ctypes.CDLL(dll)
@@ -266,6 +271,8 @@ def main():
             x.blob(f.read(), os.path.relpath(path, game))
         if i % 50 == 0:
             print(f"  {i}/{len(files)} files, {x.seen} textures, {x.written} new", flush=True)
+        if i % 10 == 9:  # what the launcher's bar reads
+            print(f"progress: {i + 1}/{len(files)} files", flush=True)
     path = os.path.join(dump, "aliases.txt")
     old = dict(line.split() for line in open(path)) if os.path.exists(path) else {}
     old.update(x.aliases)

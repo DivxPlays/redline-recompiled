@@ -78,6 +78,7 @@ static void gpu_safepoint(void) {
 
 static DWORD WINAPI gpu_proc(void *p) {
     (void)p;
+    thread_name("gpu (push buffer)");
     for (;;) {
         WaitForSingleObject(g_gpu_wake, INFINITE);
         LARGE_INTEGER t0, t1;
@@ -187,6 +188,9 @@ static int method(uint32_t subchannel, uint32_t m, uint32_t arg) {
             due = -1;
         } else if (flip && ((due >= 0 && (int64_t)GetTickCount64() >= due) || DeleteFileA("build/dump.now"))) {
             dump = g_nv2a_dump = fopen("build/frame.txt", "w");
+            /* the state the frame starts with ("s <method> <value>"): what it does not set itself was set before */
+            for (int i = 0; dump && i < KELVIN_SIZE; i++)
+                if (g_k[i]) fprintf(dump, "s %04X %08X\n", i * 4, g_k[i]);
         }
     }
     if (m == 0x0100 && arg) { /* NO_OPERATION with an argument: a software method for the driver */
@@ -321,6 +325,12 @@ uint32_t nv2a_flip_count(void) { return g_flips; }
 uint32_t nv2a_vblank_count(void) { return g_vblanks; }
 
 /* NV2A_STATS=1: method histogram at exit */
+/* one line of the GPU's state (HITCHLOG's stalls): its push buffer, whether it waits on the flip queue, the counts */
+void nv2a_brief(void) {
+    fprintf(stderr, "[stall] gpu: get %08X put %08X (%s), stalled %d, flips read %u write %u, %u flipped, %u vblanks\n",
+            g_get, g_put, g_get == g_put ? "idle" : "commands waiting", g_stalled, g_flip_read, g_flip_write, g_flips, g_vblanks);
+}
+
 void nv2a_report(void) {
     fprintf(stderr, "[nv2a] %u frames flipped (last at %08X), %u push buffer words; methods:", g_flips,
             g_display_start, g_words);

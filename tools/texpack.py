@@ -52,18 +52,28 @@ def back_project(orig, up):
     return Image.fromarray(np.clip(u + 0.5, 0, 255).astype(np.uint8))
 
 
-def esrgan(exe, src, dst, gpu):
+def esrgan(exe, src, dst, gpu, on_file=None):
+    """realesrgan on a folder; on_file() after each picture it finishes (its -v lines end "done")"""
     os.makedirs(dst, exist_ok=True)
-    cmd = [exe, "-i", src, "-o", dst, "-n", "realesrgan-x4plus", "-f", "png"]
+    cmd = [exe, "-i", src, "-o", dst, "-n", "realesrgan-x4plus", "-f", "png", "-v"]
     if gpu is not None:
         cmd += ["-g", str(gpu)]
-    r = subprocess.run(cmd, cwd=os.path.dirname(exe), capture_output=True, text=True)
-    if r.returncode:
-        sys.exit("realesrgan failed:\n" + r.stderr[-2000:])
+    p = subprocess.Popen(cmd, cwd=os.path.dirname(exe), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         errors="replace")
+    tail = []
+    for line in p.stdout:
+        if line.rstrip().endswith(" done"):
+            if on_file:
+                on_file()
+        elif not line.startswith("[") and line.strip() not in ("", "0.00%"):
+            tail = (tail + [line])[-20:]
+    if p.wait():  # its own words first: the launcher shows the last line as the reason
+        print("".join(tail)[-2000:])
+        sys.exit("Real-ESRGAN stopped: it needs a graphics card that runs Vulkan, with its driver up to date.")
 
 
-def upscale(args, batch):
-    """batch: [(key, image)] -> the pack's files"""
+def upscale(args, batch, progress=None):
+    """batch: [(key, image)] -> the pack's files; progress(fraction of the batch done) as the pictures come back"""
     tmp = tempfile.mkdtemp(prefix="texpack")
     try:
         rgb_in, alpha_in = os.path.join(tmp, "rgb"), os.path.join(tmp, "alpha")
@@ -78,9 +88,16 @@ def upscale(args, batch):
                 Image.fromarray(np.repeat(padded[..., 3:], 3, axis=2)).save(os.path.join(alpha_in, key + ".png"),
                                                                             compress_level=1)
             jobs[key] = (im, has_alpha)
-        esrgan(args.esrgan, rgb_in, os.path.join(tmp, "rgb4"), args.gpu)
+        pictures = len(jobs) + sum(1 for v in jobs.values() if v[1])
+        done = [0]
+
+        def one():
+            done[0] += 1
+            if progress and (done[0] % 10 == 0 or done[0] == pictures):
+                progress(done[0] / pictures)
+        esrgan(args.esrgan, rgb_in, os.path.join(tmp, "rgb4"), args.gpu, one)
         if any(v[1] for v in jobs.values()):
-            esrgan(args.esrgan, alpha_in, os.path.join(tmp, "alpha4"), args.gpu)
+            esrgan(args.esrgan, alpha_in, os.path.join(tmp, "alpha4"), args.gpu, one)
         for key, (im, has_alpha) in jobs.items():
             w, h = im.size
             box = (PAD * 4, PAD * 4, PAD * 4 + w * 4, PAD * 4 + h * 4)
@@ -95,10 +112,14 @@ def upscale(args, batch):
                 # channel by channel: Pillow premultiplies RGBA to resize it, which blackens the colour wherever alpha is
                 # 0, and some textures use alpha as a blend weight, not coverage (Maple Valley's road speckled black)
                 out = Image.merge(out.mode, [c.resize(size, Image.LANCZOS) for c in out.split()])
+            # written whole under another name, then renamed: stopped part way (the launcher's Cancel ends the process),
+            # a half-written file would count as done the next time
+            path = os.path.join(args.out, key + (".png" if has_alpha else ".jpg"))
             if has_alpha:
-                out.save(os.path.join(args.out, key + ".png"))
+                out.save(path + ".tmp", format="PNG")
             else:
-                out.save(os.path.join(args.out, key + ".jpg"), quality=95, subsampling=0)
+                out.save(path + ".tmp", format="JPEG", quality=95, subsampling=0)
+            os.replace(path + ".tmp", path)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -114,6 +135,9 @@ def main():
     ap.add_argument("--batch", type=int, default=400)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
+    for f in os.listdir(args.out):  # left by a run that was stopped while writing
+        if f.endswith(".tmp"):
+            os.remove(os.path.join(args.out, f))
     alias_file = os.path.join(args.dump, "aliases.txt")
     aliases = dict(line.split() for line in open(alias_file)) if os.path.exists(alias_file) else {}
     nopack_file = os.path.join(args.dump, "nopack.txt")  # fonts (tools/texextract.py)
@@ -124,20 +148,24 @@ def main():
     todo = sorted(f for f in os.listdir(args.dump) if f.lower().endswith(".dds") and f[:16].upper() not in done
                   and f[:16].upper() not in aliases and f[:16].upper() not in nopack)  # a lower mip level of a whole texture gets that one's picture
     print(f"{len(todo)} new textures in {args.dump}", flush=True)
-    batch, n = [], 0
+    batch, n, start = [], 0, 0  # start: the first of todo the batch covers
+
+    def progress(at):  # "progress: <done>/<total>" lines are what the launcher's bar reads
+        print(f"progress: {at}/{len(todo)} textures", flush=True)
     for i, f in enumerate(todo):
         try:
             im = Image.open(os.path.join(args.dump, f)).convert("RGBA")
         except Exception as e:  # a format PIL cannot read
             print(f"  skip {f}: {e}")
-            continue
-        if wanted(im):
+            im = None
+        if im is not None and wanted(im):
             batch.append((f[:16].upper(), im))
         if len(batch) == args.batch or (i == len(todo) - 1 and batch):
-            upscale(args, batch)
+            upscale(args, batch, lambda k, a=start, b=i + 1: progress(a + int((b - a) * k)))
             n += len(batch)
             print(f"  {i + 1}/{len(todo)} looked at, {n} upscaled", flush=True)
-            batch = []
+            batch, start = [], i + 1
+    progress(len(todo))
     have = {os.path.splitext(f)[0].upper() for f in os.listdir(args.out)}
     with open(os.path.join(args.out, "aliases.txt"), "w") as f:
         f.writelines(f"{k} {v}\n" for k, v in sorted(aliases.items()) if v in have)

@@ -59,6 +59,9 @@ uint32_t thread_env_init(X86Ctx *c, uint32_t stack_size, uint32_t tls_size);
 void thread_run_main(X86Ctx *c, uint32_t entry);
 uint32_t current_thread(X86Ctx *c);
 void gil_acquire(void);
+void thread_name(const char *fmt, ...);
+void profile_stacks(const char *const *names, int n); /* profile.c: host stacks of the named threads (HITCHLOG) */
+void guest_threads_report(const char *tag); /* thread.c: each guest thread's function and stack, to stderr */ /* thread.c: this host thread's name, for profilers and HITCHLOG */
 void gil_release(void);
 void dpc_start(void);
 void dpc_kick(void); /* thread.c: an interrupt was raised; run the DPC thread's pass now (any thread) */
@@ -69,6 +72,9 @@ void nv2a_init(void);
 void nv2a_tick(void);
 uint32_t nv2a_pushbuffer_run(uint32_t put);
 void nv2a_report(void);
+const char *render_screen(void); /* render.c: the device name of the screen the window is on */
+int display_vblank(double *last, double *period); /* render.c: the screen's last vblank and refresh period (QPC ms) */
+void nv2a_brief(void); /* one line: the push buffer, flip queue and counts (HITCHLOG) */
 void nv2a_vblank(void);
 int nv2a_irq_pending(void);
 void nv2a_pushbuffer_set_get(uint32_t get);
@@ -93,6 +99,7 @@ void render_motion(int on);      /* render.c: the scene writes motion vectors an
 float render_widen(void);        /* render.c: ULTRAWIDE, how much wider than 16:9 the picture is (1: not) */
 __declspec(noreturn) void fatal_exit(int code); /* main.c: the game stops on an error and tells the player why */
 void render_texpack(int on);     /* render.c: texture packs in textures\ next to the exe (texpack.c) */
+void render_menusides(int on);   /* render.c: MENU SIDES, with ULTRAWIDE: 2D screens' sides filled (1) or black */
 void render_texdump(int on);     /* render.c: write each new texture to textures\dump, for making packs */
 void video_open(uint32_t bink, const char *name);       /* video.c: Bink opened a video (upscaled cutscenes) */
 void video_copied(uint32_t bink, uint32_t frame, uint32_t dest, uint32_t span, uint32_t alpha); /* and frame n to dest */
@@ -103,12 +110,23 @@ int input_last_device(void);                                    /* hle_xinput.c 
 int input_icon_state(void); /* hle_xinput.c: the prompts' device (BUTTON PROMPTS or the last used), plus 16 x the
                              * times that or a key binding changed */
 void input_set_prompts(int v); /* 0 auto, else DEV_* + 1 */
+void input_set_shoulders(int on); /* SHIFT ON SHOULDERS */
+void input_set_rumble(int percent); /* RUMBLE STRENGTH */
 enum { BTN_A, BTN_B, BTN_X, BTN_Y, BTN_LT, BTN_RT, BTN_BLACK, BTN_WHITE, BTN_START, BTN_BACK, BTN_LEFT, BTN_DOWN,
        BTN_RIGHT, BTN_UP, BTN_COUNT }; /* the buttons a prompt can name */
 void icons_key_name(int button, wchar_t *t, int n); /* hle_xinput.c: the menu key standing in for a button */
 int input_nbindings(int menu);  /* hle_xinput.c: keyboard bindings, driving (menu = 0) or menu keys, for the settings menu */
 void input_binding_text(int menu, int k, char *t, size_t n);
 void input_capture(int menu, int k); /* the next key pressed becomes binding k */
+int input_pad_actions(void);   /* CONTROLLER BUTTONS: the racing actions a controller button can be bound to */
+int input_pad_is_custom(void); /* the player's buttons apply (else the game's layout) */
+void input_pad_text(int a, char *t, size_t n);
+void input_pad_capture(int a); /* the next controller button pressed becomes action a's */
+void input_pad_reset(void);    /* back to the game's layout */
+int mods_count(void);          /* file.c: the folders in mods (Recomp Settings > MODS) */
+const char *mods_name(int i);
+int mods_on(int i);            /* as saved (the files in use were read at startup) */
+void mods_toggle(int i);
 void forza_init(void);              /* hle_forza.c: the game's own settings, before it runs (frame pacing) */
 void forza_vblank(void);            /* hle_forza.c: each emulated vblank */
 uint32_t nv2a_display(void);        /* nv2a.c: the frame on screen (PCRTC start) */
@@ -126,11 +144,14 @@ int achieve_count(void), achieve_earned(void), achieve_has(int i), achieve_toast
 const char *achieve_name(int i), *achieve_desc(int i);           /* hle_forza.c: a menu is on screen (the pause menu too), not just the race */
 int forza_race_view(void);          /* hle_forza.c: the race, its countdown or its replay is on top; any thread */
 int forza_throwaway_view(void);     /* hle_forza.c: the race, its countdown or the pre-race screen: never kept */
+int forza_fps(void);                /* hle_forza.c: the frame rate in use (FRAME RATE, AUTO as the screen's) */
 int forza_racing(void);              /* hle_forza.c: the race (or its countdown) is the screen on top; any thread */
 void profile_run(int seconds); /* profile.c */
 #define AUDIO_RATE 48000         /* the Xbox APU's rate, and the host output's */
 void audio_start(void (*mix)(float *out, uint32_t frames, int channels)); /* audio.c: mix fills frames of 2 (L R)
                                                                              or 6 (FL FR C LFE BL BR) floats */
+void audio_chime(void); /* audio.c: the achievement sound, from now */
+void adpcm_block(const uint8_t *in, int ch, int16_t *out); /* hle_dsound.c: one Xbox ADPCM block, 65 frames of ch */
 /* audiofx.c: ENHANCED AUDIO */
 #define FX_TAPS 8 /* the resampler's taps, centred on the frame before the point read */
 #define FX_CUTS 6

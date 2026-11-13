@@ -483,6 +483,9 @@ void psh_generate(const uint32_t *k, char *dst, size_t cap, int mv) {
                 t, t, t, t, t, t, t);
         else if (mode == 4) /* PASS_THROUGH: the texture coordinate itself, clamped, as the colour */
             out(&s, "  float4 t%d = saturate(i.t%d);\n", t, t);
+        else if ((mode == 15 || mode == 16) && t > 0) /* DEPENDENT_AR / _GB: the stage before's colour picks the texel
+                                                     * (Forza's paint jobs look their colours up this way, #28) */
+            out(&s, "  float4 t%d = tex%d.Sample(smp%d, t%d.%s);\n", t, t, t, t - 1, mode == 15 ? "ar" : "gb");
         else
             out(&s, "  float4 t%d = 0; /* stage mode %u */\n", t, mode);
     }
