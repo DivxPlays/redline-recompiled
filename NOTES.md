@@ -140,9 +140,8 @@ histogram (`nv2a_report`).
 - SEH/C++ exception unwinding has no runtime support yet.
 
 ### Release checklist (0.1, as of 2026-11-04)
-**At the next release (the owner, 2026-11-12, "not right now"):** the owner chooses a README design and a trailer
-design before they are made: show the choices (/kit:design; Repo Trailers' `trailer.py styles redline` previews each
-trailer style from the footage), and build the release's README and its new trailer in the ones picked.
+**Done for 0.3.0 (2026-11-12):** the owner chose the README design (14 Big Numbers, 16 Image Buttons, with a FAQ)
+and the trailer style (hype-cuts) from a page of 8 + 7 + 8 options; docs/look.md records them.
 Works: boot, intro, title, profiles, main menu, Arcade and Free Run races (Maple Valley, Silverstone, Tsukuba),
 showroom, assists, Recomp Settings, pause/quit, videos, sound, saves.
 - **Rendered cube maps** (found by the track sweep): the table of cube maps the game renders (car reflections) had 8
